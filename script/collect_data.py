@@ -234,9 +234,6 @@ def run(TASK_ENV, args):
 
 
 if __name__ == "__main__":
-    from test_render import Sapien_TEST
-    Sapien_TEST()
-
     import torch.multiprocessing as mp
     mp.set_start_method("spawn", force=True)
 
@@ -246,5 +243,13 @@ if __name__ == "__main__":
     parser = parser.parse_args()
     task_name = parser.task_name
     task_config = parser.task_config
+
+    config_path = f"./task_config/{task_config}.yml"
+    with open(config_path, "r", encoding="utf-8") as f:
+        _cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    if _cfg.get("render_freq", 0):
+        from test_render import Sapien_TEST
+        Sapien_TEST()
 
     main(task_name=task_name, task_config=task_config)
