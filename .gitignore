@@ -5,6 +5,7 @@ __pycache__/
 **/checkpoints/
 **/processed_data/
 **/wandb/
+/wandb/
 result/
 envs/curobo
 *.zip
