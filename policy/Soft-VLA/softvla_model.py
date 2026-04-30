@@ -21,19 +21,26 @@ import torch
 import torch.nn as nn
 
 # ── resolve paths ──────────────────────────────────────────────────────────────
-# This file lives at  policy/Soft-VLA/softvla_model.py.
-# The RoboTwin runner sets cwd to the RoboTwin root, so
-#   policy/Soft-VLA/src  →  {Soft-VLA repo root}/src
+# This file lives at  <repo>/third_party/RoboTwin/policy/Soft-VLA/softvla_model.py.
 _POLICY_DIR = os.path.dirname(os.path.abspath(__file__))
-_SRC_DIR = os.path.join(_POLICY_DIR, "src")
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
+_REPO_ROOT  = os.path.abspath(os.path.join(_POLICY_DIR, "..", "..", "..", ".."))
+_SRC_DIR    = os.path.join(_REPO_ROOT, "src")
+_OPENPI_CLIENT_DIR = os.path.join(_REPO_ROOT, "packages", "openpi-client", "src")
+
+if not os.path.isdir(os.path.join(_SRC_DIR, "softvla")):
+    raise ModuleNotFoundError(
+        f"Soft-VLA src not found at {_SRC_DIR}. Expected layout: <repo>/src/softvla/."
+    )
+
+for _p in (_SRC_DIR, _OPENPI_CLIENT_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from softvla.models.softvla_config import SoftVLAConfig          # noqa: E402
 from softvla.models.softvla_pytorch import SoftVLAPytorch        # noqa: E402
 from openpi.policies import policy as _policy                    # noqa: E402
-from openpi.training import checkpoints as _checkpoints          # noqa: E402
 from openpi.training import config as _config                    # noqa: E402
+from openpi.shared import normalize as _normalize                # noqa: E402
 import openpi.transforms as _transforms                          # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -74,9 +81,19 @@ class SoftVLA:
     Args:
         train_config_name: Name of the TrainConfig registered in openpi/training/config.py
                            (e.g. "softvla_robotwin").  Used to obtain data transforms.
+                           If a fine-tune checkpoint root uses a suffix (e.g.
+                           "softvla_robotwin_ft"), this class will automatically
+                           fall back to the base TrainConfig name when resolving
+                           OpenPI transforms.
         model_name:        Experiment / checkpoint name (directory under train_config_name).
         checkpoint_id:     Checkpoint step number (sub-directory under model_name).
-        softvla_step:      Number of flow-matching denoising steps (action execution length).
+        softvla_step:      Number of actions to execute per inference call (action chunk
+                           execution length).  Matches the semantics of pi0_step in PI0.
+                           E.g. softvla_step=8 executes only the first 8 actions from the
+                           predicted action_horizon-length chunk.
+        num_denoise_steps: Number of flow-matching ODE integration steps used when generating
+                           actions.  Higher values give higher-quality actions but increase
+                           inference latency.  Default 10.
         domain_id:         Index into SoftPromptHub; selects the embodiment-specific soft prompt.
                            Default 0 works when only one embodiment is registered.
     """
@@ -87,6 +104,7 @@ class SoftVLA:
         model_name: str,
         checkpoint_id: int,
         softvla_step: int,
+        num_denoise_steps: int = 10,
         domain_id: int = 0,
     ):
         self.softvla_step = softvla_step
@@ -107,7 +125,22 @@ class SoftVLA:
             )
 
         # ── TrainConfig → transforms ────────────────────────────────────────
-        train_config = _config.get_config(train_config_name)
+        # Fine-tune checkpoints are often saved under "*_ft" roots while the
+        # registered OpenPI TrainConfig remains the base name.
+        resolved_train_config_name = train_config_name
+        try:
+            train_config = _config.get_config(resolved_train_config_name)
+        except ValueError:
+            if train_config_name.endswith("_ft"):
+                resolved_train_config_name = train_config_name[: -len("_ft")]
+                logger.warning(
+                    "TrainConfig '%s' not registered; falling back to '%s' for transforms.",
+                    train_config_name,
+                    resolved_train_config_name,
+                )
+                train_config = _config.get_config(resolved_train_config_name)
+            else:
+                raise
         pi0_cfg = train_config.model  # Pi0Config instance
 
         # Build SoftVLAConfig whose architecture fields mirror the Pi0Config.
@@ -125,19 +158,19 @@ class SoftVLA:
         # ── load SoftVLAPytorch weights ─────────────────────────────────────
         logger.info("Loading SoftVLAPytorch from %s", weight_path)
         raw_model = SoftVLAPytorch(softvla_cfg)
-        safetensors.torch.load_model(raw_model, weight_path)
+        safetensors.torch.load_model(raw_model, weight_path, strict=False)
         raw_model.to(torch.bfloat16)
         logger.info("SoftVLAPytorch loaded successfully.")
 
         # ── wrap for domain_ids injection ───────────────────────────────────
-        wrapped = _SoftVLAInferenceWrapper(raw_model, domain_id=domain_id, num_steps=softvla_step)
+        wrapped = _SoftVLAInferenceWrapper(raw_model, domain_id=domain_id, num_steps=num_denoise_steps)
 
         # ── norm_stats from checkpoint assets ───────────────────────────────
         entries = [e for e in os.listdir(assets_path) if not e.startswith(".")]
         if not entries:
             raise FileNotFoundError(f"No asset subdirectory found in {assets_path}")
         assets_id = entries[0]
-        norm_stats = _checkpoints.load_norm_stats(assets_path, assets_id)
+        norm_stats = _normalize.load(os.path.join(assets_path, assets_id))
 
         # ── data / model transforms ─────────────────────────────────────────
         # Create transforms without loading norm_stats again (assets dir may not
@@ -173,22 +206,42 @@ class SoftVLA:
         logger.info("Instruction set: %s", instruction)
 
     def update_observation_window(self, img_arr: list, state: np.ndarray) -> None:
-        """Update the observation buffer with the latest camera images and joint state.
+        """Update the observation buffer with the latest camera images and end-effector state.
 
         Args:
             img_arr: List of three HWC uint8 numpy arrays:
                      [head/front camera, right wrist camera, left wrist camera]
-            state:   1-D float array of joint positions (e.g. 14-D for bimanual).
+            state:   1-D float array. For Soft-VLA right-only EE deployment this
+                     is 10-D
+                     ``[right_xyz(3), right_rot6d(6), right_gripper(1)]``.
+                     Other state representations are also accepted; OpenPI
+                     transforms zero-pad to the model action_dim.
         """
-        img_front, img_right, img_left = img_arr[0], img_arr[1], img_arr[2]
+        def _to_chw(img: np.ndarray) -> np.ndarray:
+            # RoboTwin returns HWC uint8; OpenPI's RoboTwin / Aloha input transforms
+            # expect CHW (matching PI05 conventions) and rearrange to HWC internally.
+            arr = np.asarray(img)
 
-        # HWC → CHW as expected by AlohaInputs
-        img_front = np.transpose(img_front, (2, 0, 1))
-        img_right = np.transpose(img_right, (2, 0, 1))
-        img_left  = np.transpose(img_left,  (2, 0, 1))
+            if arr.ndim == 4 and arr.shape[0] == 1:
+                arr = arr[0]
+
+            if arr.ndim != 3:
+                return arr
+
+            if arr.shape[0] in (1, 3, 4):
+                return arr
+
+            if arr.shape[-1] in (1, 3, 4):
+                return np.transpose(arr, (2, 0, 1))
+
+            return arr
+
+        img_front = _to_chw(img_arr[0])
+        img_right = _to_chw(img_arr[1])
+        img_left  = _to_chw(img_arr[2])
 
         self.observation_window = {
-            "state": state,
+            "state": np.asarray(state, dtype=np.float32),
             "images": {
                 "cam_high":        img_front,
                 "cam_left_wrist":  img_left,

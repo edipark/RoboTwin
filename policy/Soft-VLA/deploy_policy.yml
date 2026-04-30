@@ -14,11 +14,17 @@ train_config_name: null
 # Checkpoint experiment name (directory under train_config_name/).
 model_name: null
 
-# Checkpoint step to load.
+# Checkpoint step to load. Override via eval.sh <checkpoint_id> argument.
 checkpoint_id: 30000
 
-# Number of flow-matching denoising steps executed per action chunk.
-softvla_step: 50
+# Number of actions to execute per inference call (action chunk execution length).
+# This is like pi0_step in PI0: get_action()[:softvla_step].
+# Should be <= action_horizon (model default: 16).
+softvla_step: 16
+
+# Number of flow-matching ODE integration steps for action generation.
+# Higher = better quality actions but slower inference. Separate from softvla_step.
+num_denoise_steps: 10
 
 # Embodiment index for the SoftPromptHub (0 = first registered robot).
 domain_id: 0

@@ -68,6 +68,20 @@ class Base_Task(gym.Env):
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
+        # active_arms: which arm(s) are allowed to move during take_action.
+        #   "both"  (default) : original dual-arm behaviour
+        #   "right"            : right-arm-only operation; left arm is held at
+        #                        its current joint targets every control step.
+        # The setting is honoured by ``take_action`` for action_type in
+        # {qpos, ee} during data collection.  The Soft-VLA right-only eval
+        # path (action_type='ee_right_10d') always holds the left arm
+        # regardless of this flag.
+        active_arms_raw = kwags.get("active_arms", "both")
+        self.active_arms = str(active_arms_raw).lower()
+        if self.active_arms not in ("both", "right"):
+            raise ValueError(
+                f"active_arms must be 'both' or 'right', got {active_arms_raw!r}"
+            )
 
         self.need_topp = True  # TODO
 
@@ -1415,6 +1429,7 @@ class Base_Task(gym.Env):
             control_seq["right_arm"],
             control_seq["right_gripper"],
         )
+        allow_left = self.active_arms != "right"
 
         save_freq = self.save_freq if save_freq == -1 else save_freq
         if save_freq != None:
@@ -1422,9 +1437,9 @@ class Base_Task(gym.Env):
 
         max_control_len = 0
 
-        if left_arm is not None:
+        if allow_left and left_arm is not None:
             max_control_len = max(max_control_len, left_arm["position"].shape[0])
-        if left_gripper is not None:
+        if allow_left and left_gripper is not None:
             max_control_len = max(max_control_len, left_gripper["num_step"])
         if right_arm is not None:
             max_control_len = max(max_control_len, right_arm["position"].shape[0])
@@ -1433,14 +1448,14 @@ class Base_Task(gym.Env):
 
         for control_idx in range(max_control_len):
 
-            if (left_arm is not None and control_idx < left_arm["position"].shape[0]):  # control left arm
+            if (allow_left and left_arm is not None and control_idx < left_arm["position"].shape[0]):  # control left arm
                 self.robot.set_arm_joints(
                     left_arm["position"][control_idx],
                     left_arm["velocity"][control_idx],
                     "left",
                 )
 
-            if left_gripper is not None and control_idx < left_gripper["num_step"]:
+            if allow_left and left_gripper is not None and control_idx < left_gripper["num_step"]:
                 self.robot.set_gripper(
                     left_gripper["result"][control_idx],
                     "left",
@@ -1476,7 +1491,12 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
-    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
+    def take_action(self, action, action_type:Literal['qpos', 'ee', 'ee_right_10d']='qpos'):
+        # action_type:
+        #   'qpos'         : dual-arm joint targets
+        #   'ee'           : dual-arm 16-D EE pose [xyz+quat+gripper] x 2
+        #   'ee_right_10d' : right-arm-only 10-D Soft-VLA action
+        #                    [right_xyz(3), right_rot6d(6), right_gripper(1)]
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
 
@@ -1490,6 +1510,11 @@ class Base_Task(gym.Env):
         self._update_render()
         if self.render_freq:
             self.viewer.render()
+
+        # ── Right-only 10-D Soft-VLA action ────────────────────────────────
+        if action_type == 'ee_right_10d':
+            self._take_action_right_10d(action)
+            return
 
         actions = np.array([action])
         left_jointstate = self.robot.get_left_arm_jointState()
@@ -1523,6 +1548,20 @@ class Base_Task(gym.Env):
             self.robot.get_left_gripper_val(),
             self.robot.get_right_gripper_val(),
         )
+
+        # Right-only enforcement: replace any incoming left commands with the
+        # current left state so the planner / control loop produce a no-op for
+        # the left arm while the right arm executes the demanded motion.
+        if self.active_arms == "right":
+            if action_type == 'qpos':
+                left_current_qpos_now = np.array(left_jointstate[:-1])
+                left_arm_actions = np.tile(left_current_qpos_now, (left_arm_actions.shape[0], 1))
+            elif action_type == 'ee':
+                left_current_pose = np.asarray(self.robot.get_left_ee_pose(), dtype=np.float64)
+                left_arm_actions = np.tile(left_current_pose, (left_arm_actions.shape[0], 1))
+            left_gripper_actions = np.full_like(
+                left_gripper_actions, fill_value=float(left_current_gripper)
+            )
 
         left_gripper_path = np.hstack((left_current_gripper, left_gripper_actions))
         right_gripper_path = np.hstack((right_current_gripper, right_gripper_actions))
@@ -1663,6 +1702,93 @@ class Base_Task(gym.Env):
 
         self._update_render()
         if self.render_freq:  # UI
+            self.viewer.render()
+
+
+    def _take_action_right_10d(self, action):
+        """Execute one right-arm-only 10-D Soft-VLA action.
+
+        Action layout (matches ``openpi.policies.right_only_layout``):
+            [ right_xyz(3), right_rot6d(6), right_gripper(1) ]
+
+        The left arm is held at its current joint targets and the left gripper
+        is held at its current opening for the entire control loop.  Only the
+        right arm and right gripper move.
+        """
+        from .utils.rot6d import (
+            RIGHT_ONLY_ACTION_DIM,
+            rot6d_10d_to_pose_quat,
+        )
+
+        action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        action_arr = action_arr[:RIGHT_ONLY_ACTION_DIM] # in case of 32D action padding of PI
+        if action_arr.shape[0] != RIGHT_ONLY_ACTION_DIM:
+            raise ValueError(
+                f"ee_right_10d action must have {RIGHT_ONLY_ACTION_DIM} dims, "
+                f"got {action_arr.shape[0]}"
+            )
+
+        right_pose7, right_gripper_target = rot6d_10d_to_pose_quat(action_arr)
+        right_gripper_target = float(np.clip(right_gripper_target, 0.0, 1.0))
+
+        # ── Plan right arm only ─────────────────────────────────────────────
+        right_result = self.robot.right_plan_path(right_pose7.tolist())
+        if right_result.get("status") != "Success":
+            right_n_step = 50
+            topp_right_flag = False
+        else:
+            right_n_step = right_result["position"].shape[0]
+            topp_right_flag = True
+
+        # ── Right gripper interpolation ─────────────────────────────────────
+        right_current_gripper = self.robot.get_right_gripper_val()
+        right_gripper_path = np.array(
+            [right_current_gripper, right_gripper_target], dtype=np.float64
+        )
+        if right_n_step <= 0:
+            right_gripper_traj = np.array([right_gripper_target], dtype=np.float64)
+        else:
+            right_gripper_traj = np.linspace(
+                right_gripper_path[0], right_gripper_path[1], right_n_step,
+            )
+
+        # ── Hold left arm ───────────────────────────────────────────────────
+        left_jointstate = self.robot.get_left_arm_jointState()
+        left_hold_qpos = np.array(left_jointstate[:-1], dtype=np.float64)
+        left_hold_vel  = np.zeros_like(left_hold_qpos)
+        left_hold_gripper = float(self.robot.get_left_gripper_val())
+
+        # ── Control loop (right arm advances; left arm held at hold qpos) ──
+        now_right_id = 0
+        while now_right_id < right_n_step:
+            if topp_right_flag:
+                self.robot.set_arm_joints(
+                    right_result["position"][now_right_id],
+                    right_result["velocity"][now_right_id],
+                    "right",
+                )
+            self.robot.set_gripper(right_gripper_traj[now_right_id], "right")
+
+            # Re-issue left arm hold targets every step so it stays put.
+            self.robot.set_arm_joints(left_hold_qpos, left_hold_vel, "left")
+            self.robot.set_gripper(left_hold_gripper, "left")
+
+            now_right_id += 1
+
+            self.scene.step()
+            self._update_render()
+
+            if self.check_success():
+                self.eval_success = True
+                self.get_obs()
+                if (self.eval_video_path is not None):
+                    self.eval_video_ffmpeg.stdin.write(
+                        self.now_obs["observation"]["head_camera"]["rgb"].tobytes()
+                    )
+                return
+
+        self._update_render()
+        if self.render_freq:
             self.viewer.render()
 
 

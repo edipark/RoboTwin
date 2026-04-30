@@ -3,6 +3,8 @@ data/*
 !data/process_stuck.py
 __pycache__/
 **/checkpoints/
+**/processed_data/
+**/wandb/
 result/
 envs/curobo
 *.zip

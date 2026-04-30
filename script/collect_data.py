@@ -95,6 +95,7 @@ def main(task_name=None, task_config=None):
     print("\033[94mWrist Camera Config:\033[0m " + str(args["camera"]["wrist_camera_type"]) + f", " +
           str(args["camera"]["collect_wrist_camera"]))
     print("\033[94mEmbodiment Config:\033[0m " + embodiment_name)
+    print("\033[94mActive Arms:\033[0m " + str(args.get("active_arms", "both")))
     print("\n==================================")
 
     args["embodiment_name"] = embodiment_name
