@@ -1,5 +1,15 @@
 """RoboTwin deploy_policy interface for Soft-VLA (right-arm-only 10-D actions).
 
+.. note::
+   This module is imported in **both** environments:
+
+   * The RoboTwin conda env (has sapien, no flax) – runs the simulator client.
+   * The Soft-VLA venv (has flax, torch, softvla) – runs the policy server.
+
+   All heavy imports (``softvla_model``, which chains to flax) are therefore
+   **lazy** – deferred to the functions that actually need them so that a bare
+   ``import deploy_policy`` from the RoboTwin conda env succeeds cleanly.
+
 Follows the same structure as policy/pi05/deploy_policy.py.
 
 State / action layout (matches scripts/process_data.py output):
@@ -12,12 +22,16 @@ rot6d back into a quaternion, plans the right arm, and holds the left arm in
 place.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 
 import numpy as np
 
 # ── make the Soft-VLA source accessible ───────────────────────────────────────
+# NOTE: softvla_model (and hence flax) is intentionally NOT imported here at
+# module level so this file can be imported in the RoboTwin conda env.
 _POLICY_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC_DIR = os.path.join(_POLICY_DIR, "src")
 if _POLICY_DIR not in sys.path:
@@ -25,13 +39,9 @@ if _POLICY_DIR not in sys.path:
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from softvla_model import SoftVLA  # noqa: E402
-
-# Local rot6d helpers (RoboTwin envs/utils mirror of openpi.policies.right_only_layout).
-from envs.utils.rot6d import (  # noqa: E402
-    RIGHT_ONLY_ACTION_DIM,
-    pose_quat_to_rot6d_10d,
-)
+# NOTE: rot6d helpers (RIGHT_ONLY_ACTION_DIM, pose_quat_to_rot6d_10d) are
+# imported lazily inside the functions that use them (_ee_state_from_obs, eval)
+# so this file can be imported in the Soft-VLA venv without transforms3d/sapien.
 
 
 # ── observation encoding ───────────────────────────────────────────────────────
@@ -48,6 +58,7 @@ def _ee_state_from_obs(observation: dict) -> np.ndarray:
             "RoboTwin observation has no 'endpose' field. "
             "Set `data_type.endpose: true` in the task config."
         )
+    from envs.utils.rot6d import pose_quat_to_rot6d_10d  # lazy: needs transforms3d (conda only)
     ep = observation["endpose"]
     right_endpose = np.asarray(ep["right_endpose"], dtype=np.float32).reshape(-1)
     right_gripper = float(np.asarray(ep["right_gripper"]).reshape(-1)[0])
@@ -89,6 +100,7 @@ def get_model(usr_args: dict) -> SoftVLA:
                                         but slower. Separate from softvla_step.
             domain_id          (int, optional) – embodiment index for soft prompt (default 0)
     """
+    from softvla_model import SoftVLA  # lazy: only needed in venv (server side)
     return SoftVLA(
         train_config_name=usr_args["train_config_name"],
         model_name=usr_args["model_name"],
@@ -101,25 +113,39 @@ def get_model(usr_args: dict) -> SoftVLA:
 
 # ── evaluation loop ────────────────────────────────────────────────────────────
 
-def eval(TASK_ENV, model: SoftVLA, observation: dict) -> None:
+def eval(TASK_ENV, model, observation: dict) -> None:  # noqa: A001
     """Run one action-chunk evaluation step.
 
-    At the first call (observation_window is None), initialises the language
-    instruction.  For each subsequent call the observation window is updated
-    before inference.
+    Works in two modes:
+
+    * **Single-process** (``model`` is a ``SoftVLA`` instance): direct attribute
+      access — used by ``eval.sh``.
+    * **Dual-env** (``model`` is a ``ModelClient`` with a ``.call()`` method):
+      all inference is routed through the socket to the policy server — used
+      by ``eval_double_env.sh``.
     """
-    if model.observation_window is None:
-        instruction = TASK_ENV.get_instruction()
-        model.set_language(instruction)
-
     input_rgb_arr, input_state = encode_obs(observation)
-    model.update_observation_window(input_rgb_arr, input_state)
+    instruction = TASK_ENV.get_instruction()
 
-    # ── get action chunk ────────────────────────────────────────────────────
-    actions = model.get_action()[: model.softvla_step]
+    if hasattr(model, "call"):  # ── dual-env: delegate to policy server via socket
+        obs_packed = {
+            "img_arr": input_rgb_arr,
+            "state": input_state,
+            "instruction": instruction,
+        }
+        result = model.call("eval_step", obs=obs_packed)
+        actions = np.asarray(result["actions"])
+        softvla_step = int(result["softvla_step"])
+    else:  # ── single-process: direct SoftVLA access
+        if model.observation_window is None:
+            model.set_language(instruction)
+        model.update_observation_window(input_rgb_arr, input_state)
+        actions = model.get_action()
+        softvla_step = model.softvla_step
 
     # ── execute each action step (right-only EE: xyz + rot6d + gripper) ─────
-    for action in actions:
+    from envs.utils.rot6d import RIGHT_ONLY_ACTION_DIM  # lazy: needs transforms3d (conda only)
+    for action in actions[:softvla_step]:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.shape[0] < RIGHT_ONLY_ACTION_DIM:
             raise ValueError(
@@ -129,11 +155,12 @@ def eval(TASK_ENV, model: SoftVLA, observation: dict) -> None:
         TASK_ENV.take_action(action[:RIGHT_ONLY_ACTION_DIM], action_type="ee_right_10d")
         observation = TASK_ENV.get_obs()
         input_rgb_arr, input_state = encode_obs(observation)
-        model.update_observation_window(input_rgb_arr, input_state)
+        if not hasattr(model, "call"):  # single-process: update obs window in-loop
+            model.update_observation_window(input_rgb_arr, input_state)
 
 
 # ── episode reset ──────────────────────────────────────────────────────────────
 
-def reset_model(model: SoftVLA) -> None:
+def reset_model(model) -> None:
     """Clear observation cache and instruction at the beginning of each episode."""
     model.reset_observation_windows()

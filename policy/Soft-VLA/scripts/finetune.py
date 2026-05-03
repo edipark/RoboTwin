@@ -24,6 +24,7 @@ Checkpoint layout (compatible with policy/Soft-VLA/eval.sh):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
@@ -119,6 +120,7 @@ def save_checkpoint(
     step: int,
     ckpt_dir: pathlib.Path,
     *,
+    norm_stats: dict | None = None,
     blocking: bool = False,
 ) -> None:
     """Async checkpoint writer compatible with Soft-VLA checkpoint format."""
@@ -144,6 +146,9 @@ def save_checkpoint(
         if final.exists():
             shutil.rmtree(final)
         tmp.rename(final)
+        # Write norm_stats AFTER rename so it is never deleted by rmtree(final).
+        if norm_stats is not None:
+            _save_norm_stats_with_ckpt(norm_stats, final)
 
     _ckpt_thread = threading.Thread(target=_write, daemon=True, name=f"ckpt-{step}")
     _ckpt_thread.start()
@@ -467,10 +472,18 @@ def parse_args():
     # ── Pre-trained model ─────────────────────────────────────────────────
     p.add_argument(
         "--src_ckpt_dir",
-        required=True,
-        help="Pre-trained checkpoint root dir (contains <step>/model.safetensors).",
+        default=None,
+        help="Pre-trained checkpoint root dir (contains <step>/model.safetensors). "
+             "Mutually exclusive with --phase2_checkpoint.",
     )
-    p.add_argument("--src_ckpt_step", type=int, required=True)
+    p.add_argument("--src_ckpt_step", type=int, default=None)
+    p.add_argument(
+        "--phase2_checkpoint",
+        default=None,
+        help="Direct path to a checkpoint directory containing model.safetensors. "
+             "e.g. ./checkpoints/p2_xvla_action_decoder_v1/best. "
+             "Mutually exclusive with --src_ckpt_dir/--src_ckpt_step.",
+    )
 
     # ── Model architecture (must match pre-trained model) ─────────────────
     p.add_argument(
@@ -517,6 +530,28 @@ def parse_args():
     p.add_argument("--save_interval",    type=int,   default=2_000)
     p.add_argument("--log_interval",     type=int,   default=10)
     p.add_argument("--num_workers",      type=int,   default=4)
+
+    # ── 2-stage adaptation (LIBERO-style) ────────────────────────────────
+    p.add_argument(
+        "--stage1_steps",
+        type=int,
+        default=None,
+        help="Stage 1 step count: train soft_prompt + action_out_proj only (backbone frozen). "
+             "When set, overrides --finetune_steps; total = stage1_steps + stage2_steps.",
+    )
+    p.add_argument(
+        "--stage2_steps",
+        type=int,
+        default=0,
+        help="Stage 2 step count: joint training with Expert Gemma + action_in_proj unfrozen. "
+             "Only used when --stage1_steps is set.",
+    )
+    p.add_argument(
+        "--stage2_lr",
+        type=float,
+        default=None,
+        help="Peak LR for Stage 2 joint training. Defaults to --lr when not set.",
+    )
     p.add_argument("--seed",             type=int,   default=42)
 
     # ── Expert Gemma unfreezing ────────────────────────────────────────────
@@ -553,6 +588,18 @@ def parse_args():
         help="Resume from the latest checkpoint in the output directory.",
     )
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches to accumulate before an optimizer step. "
+             "Effective batch size = batch_size * gradient_accumulation_steps.",
+    )
+    p.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce VRAM usage at the cost of ~30%% more compute.",
+    )
     p.add_argument("--image_size", type=int, default=224)
 
     # ── W&B ───────────────────────────────────────────────────────────────
@@ -606,7 +653,7 @@ def main():
 
     # ── Output checkpoint dir ────────────────────────────────────────────
     # All ranks create the directory (exist_ok=True is safe); no barrier needed.
-    ckpt_dir = pathlib.Path("checkpoints") / "softvla_robotwin_ft" / args.exp_name
+    ckpt_dir = pathlib.Path(_ROBOTWIN_ROOT) / "checkpoints" / "softvla_robotwin_ft" / args.exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Norm stats ───────────────────────────────────────────────────────
@@ -678,30 +725,58 @@ def main():
     model = SoftVLAPytorch(softvla_cfg).to(device)
 
     # ── Load pre-trained weights (with hub expansion if needed) ───────────
-    src_ckpt_root = _resolve_src_ckpt(args.src_ckpt_dir)
-    src_weight = os.path.join(src_ckpt_root, str(args.src_ckpt_step), "model.safetensors")
-    if not os.path.isfile(src_weight):
-        raise FileNotFoundError(f"Pre-trained model not found: {src_weight}")
-
-    if _is_main:
-        log.info("Loading pre-trained weights from %s", src_weight)
+    # Two mutually exclusive loading modes:
+    #   (a) --phase2_checkpoint <dir>  → dir/model.safetensors loaded directly
+    #   (b) --src_ckpt_dir + --src_ckpt_step  → <dir>/<step>/model.safetensors (legacy)
+    if args.phase2_checkpoint is not None:
+        ckpt_path = pathlib.Path(args.phase2_checkpoint)
+        if not ckpt_path.is_absolute():
+            ckpt_path = pathlib.Path.cwd() / args.phase2_checkpoint
+        src_weight = str(ckpt_path / "model.safetensors")
+        if not os.path.isfile(src_weight):
+            raise FileNotFoundError(
+                f"--phase2_checkpoint: model.safetensors not found at {src_weight}"
+            )
+        if _is_main:
+            log.info("Loading pre-trained weights from --phase2_checkpoint: %s", src_weight)
+    else:
+        if args.src_ckpt_dir is None or args.src_ckpt_step is None:
+            raise ValueError(
+                "Must provide either --phase2_checkpoint  OR  "
+                "both --src_ckpt_dir and --src_ckpt_step."
+            )
+        src_ckpt_root = _resolve_src_ckpt(args.src_ckpt_dir)
+        src_weight = os.path.join(src_ckpt_root, str(args.src_ckpt_step), "model.safetensors")
+        if not os.path.isfile(src_weight):
+            raise FileNotFoundError(f"Pre-trained model not found: {src_weight}")
+        if _is_main:
+            log.info("Loading pre-trained weights from %s", src_weight)
     _load_with_hub_expansion(model, src_weight, pretrained_num_robots=args.num_robots)
+
+    # ── Gradient checkpointing (must be set before DDP wrapping) ─────────
+    if args.gradient_checkpointing:
+        model.pi0.gradient_checkpointing_enable()
+        if _is_main:
+            log.info("Gradient checkpointing enabled.")
 
     # ── Phase 2 param setup (freeze backbone, unfreeze prompts+action_out) ─
     setup_phase2_params(model, unfreeze_expert=False)
 
     # ── Wrap with DDP ─────────────────────────────────────────────────────
     if use_ddp:
+        # find_unused_parameters=True is required when:
+        #   (a) frozen parameters exist (not all params produce gradients), AND/OR
+        #   (b) gradient checkpointing is active inside the model.
+        # _set_static_graph() is incompatible with gradient checkpointing because
+        # checkpointing recomputes the forward pass during backward, changing the
+        # autograd hook call order that static-graph mode expects, which causes
+        # "expect_autograd_hooks_ INTERNAL ASSERT FAILED" (reducer.cpp:1633).
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=False,
+            find_unused_parameters=False, # Action expert full finetune
             gradient_as_bucket_view=True,
         )
-        # Forward/backward graph is fixed every iteration; _set_static_graph()
-        # handles frozen parameters correctly and is required when gradient
-        # checkpointing is active inside the model (prevents "marked ready twice").
-        model._set_static_graph()
     model_raw = model.module if use_ddp else model
 
     # ── Optimizer ─────────────────────────────────────────────────────────
@@ -767,14 +842,48 @@ def main():
     loss_sq_acc = 0.0   # for std computation
     _loader_epoch = 0   # tracks dataset epochs for DistributedSampler
 
+    # ── 2-stage vs single-stage: resolve total steps ─────────────────────
+    # When --stage1_steps is set, use 2-stage adaptation (LIBERO-style):
+    #   Stage 1: soft_prompt + action_out_proj only  (stage1_steps iterations)
+    #   Stage 2: + Expert Gemma + action_in_proj     (stage2_steps iterations)
+    # Otherwise fall back to the single-stage --finetune_steps.
+    _use_2stage   = args.stage1_steps is not None
+    _stage1_steps = args.stage1_steps if _use_2stage else 0
+    _stage2_steps = args.stage2_steps if _use_2stage else 0
+    _stage2_lr    = args.stage2_lr if args.stage2_lr is not None else args.lr
+    total_finetune_steps = (_stage1_steps + _stage2_steps) if _use_2stage else args.finetune_steps
+
+    if _is_main:
+        if _use_2stage:
+            log.info(
+                "2-stage adaptation: stage1=%d steps (frozen backbone), "
+                "stage2=%d steps (joint, lr=%.2e)  total=%d",
+                _stage1_steps, _stage2_steps, _stage2_lr, total_finetune_steps,
+            )
+        else:
+            log.info("Single-stage fine-tuning: %d steps", total_finetune_steps)
+
+    accum_steps = args.gradient_accumulation_steps
+    micro_step  = 0          # counts micro-batches within current accumulation cycle
+    accum_loss  = 0.0        # running sum of (loss / accum_steps) for current cycle
+
     loader_iter = iter(loader)
     t0 = time.time()
     t_interval = time.time()  # wall-clock at start of current log interval
 
     if _is_main:
-        log.info("Starting Phase-2 fine-tuning for %d steps", args.finetune_steps)
+        log.info(
+            "Starting Phase-2 fine-tuning for %d steps "
+            "(gradient_accumulation_steps=%d, effective_batch=%d)",
+            total_finetune_steps,
+            accum_steps,
+            args.batch_size * accum_steps,
+        )
 
-    while step < start_step + args.finetune_steps:
+    # Zero gradients before the very first accumulation cycle
+    optimizer.zero_grad(set_to_none=True)
+
+    while step < start_step + total_finetune_steps:
         # ── Infinite loader cycling ────────────────────────────────────────
         try:
             batch = next(loader_iter)
@@ -785,58 +894,117 @@ def main():
             loader_iter = iter(loader)
             batch = next(loader_iter)
 
-        # ── Optional expert unfreeze ───────────────────────────────────────
+        # ── Stage transition: Stage 1 → Stage 2 (2-stage mode only) ─────────
+        rel_step = step - start_step   # 0-based step within this fine-tune run
         if (
-            not expert_unfrozen
+            _use_2stage
+            and not expert_unfrozen
+            and rel_step >= _stage1_steps
+        ):
+            if _is_main:
+                log.info(
+                    "Step %d: Stage 2 start — unfreezing Expert Gemma + action_in_proj, "
+                    "resetting LR to %.2e",
+                    step, _stage2_lr,
+                )
+            setup_phase2_params(model_raw, unfreeze_expert=True)
+            # Rebuild optimizer so newly unfrozen params are included
+            trainable_params = [p for p in model_raw.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=_stage2_lr, weight_decay=1e-4)
+            optimizer.zero_grad(set_to_none=True)
+            expert_unfrozen = True
+            if _is_main and args.wandb_enabled:
+                _wandb_log({"event/expert_unfrozen": 1, "event/stage2_start": step}, step=step)
+
+        # ── Legacy single-stage expert unfreeze (backward compat) ─────────
+        elif (
+            not _use_2stage
+            and not expert_unfrozen
             and args.unfreeze_expert_step is not None
-            and (step - start_step) >= args.unfreeze_expert_step
+            and rel_step >= args.unfreeze_expert_step
         ):
             if _is_main:
                 log.info("Step %d: unfreezing Expert Gemma + action_in_proj", step)
             setup_phase2_params(model_raw, unfreeze_expert=True)
-            # Rebuild optimizer to include newly unfrozen params
             trainable_params = [p for p in model_raw.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+            optimizer.zero_grad(set_to_none=True)
             expert_unfrozen = True
             if _is_main and args.wandb_enabled:
                 _wandb_log({"event/expert_unfrozen": 1}, step=step)
 
-        # ── LR schedule ────────────────────────────────────────────────────
-        current_lr = cosine_lr(
-            step=step - start_step,
-            warmup=args.warmup_steps,
-            total=args.finetune_steps,
-            peak=args.lr,
-        )
+        # ── LR schedule (based on optimizer step) ─────────────────────────
+        if _use_2stage:
+            if rel_step < _stage1_steps:
+                # Stage 1: cosine over stage1_steps
+                current_lr = cosine_lr(
+                    step=rel_step,
+                    warmup=args.warmup_steps,
+                    total=_stage1_steps,
+                    peak=args.lr,
+                )
+            else:
+                # Stage 2: cosine over stage2_steps, relative to stage transition
+                rel_step_s2 = rel_step - _stage1_steps
+                current_lr = cosine_lr(
+                    step=rel_step_s2,
+                    warmup=args.warmup_steps,
+                    total=max(_stage2_steps, 1),
+                    peak=_stage2_lr,
+                )
+        else:
+            current_lr = cosine_lr(
+                step=rel_step,
+                warmup=args.warmup_steps,
+                total=total_finetune_steps,
+                peak=args.lr,
+            )
         for pg in optimizer.param_groups:
             pg["lr"] = current_lr
 
-        # ── Forward pass ───────────────────────────────────────────────────
+        # ── Forward + backward (with optional DDP no_sync) ────────────────
         obs, actions, domain_ids = batch_to_observation(batch, device)
 
-        mse = model(phase=2, observation=obs, actions=actions, domain_ids=domain_ids)
-        loss = mse.mean()
+        is_last_micro = (micro_step % accum_steps) == (accum_steps - 1)
+        # Suppress DDP gradient sync on all but the last micro-step
+        sync_ctx = (
+            contextlib.nullcontext()
+            if (not use_ddp or is_last_micro)
+            else model.no_sync()
+        )
+        with sync_ctx:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                mse = model(phase=2, observation=obs, actions=actions, domain_ids=domain_ids)
+            loss = mse.mean() / accum_steps   # scale so gradients are averaged
+            loss.backward()
 
-        # ── Backward pass ──────────────────────────────────────────────────
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()   # DDP syncs gradients automatically
+        accum_loss += loss.item()
+        micro_step += 1
+
+        if not is_last_micro:
+            # Not yet time to step the optimizer — continue accumulating
+            continue
+
+        # ── Optimizer step (every accum_steps micro-batches) ───────────────
         grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], args.grad_clip
         )
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
         # Average loss across ranks for accurate logging
         if use_ddp:
-            _loss_t = loss.detach().clone()
+            _loss_t = torch.tensor(accum_loss, device=device)
             # Gloo backend does not support ReduceOp.AVG; use SUM/world_size so
             # loss averaging works for both NCCL and Gloo.
             dist.all_reduce(_loss_t, op=dist.ReduceOp.SUM)
             _loss_t /= dist.get_world_size()
             loss_item = _loss_t.item()
         else:
-            loss_item = loss.item()
+            loss_item = accum_loss
         loss_acc    += loss_item
         loss_sq_acc += loss_item ** 2
+        accum_loss   = 0.0
         step += 1
 
         # ── Logging (main process only) ────────────────────────────────────
@@ -848,8 +1016,8 @@ def main():
             elapsed      = time.time() - t0
             steps_so_far = step - start_step
             steps_per_s  = steps_so_far / elapsed if elapsed > 0 else 0
-            samples_per_s = steps_per_s * args.batch_size
-            eta_s        = (args.finetune_steps - steps_so_far) / steps_per_s if steps_per_s > 0 else 0
+            samples_per_s = steps_per_s * args.batch_size * accum_steps
+            eta_s        = (total_finetune_steps - steps_so_far) / steps_per_s if steps_per_s > 0 else 0
 
             # interval-level timing (more accurate than cumulative avg)
             now = time.time()
@@ -862,7 +1030,7 @@ def main():
                 "step %6d/%d | loss %.4f±%.4f | grad_norm %.3f | lr %.2e | "
                 "%.1f steps/s | %.0f samp/s | ETA %.0fs",
                 step,
-                start_step + args.finetune_steps,
+                start_step + total_finetune_steps,
                 avg_loss,
                 loss_std,
                 grad_norm.item(),
@@ -879,7 +1047,7 @@ def main():
                     "train/lr":           current_lr,
                     "train/epoch":        epoch,
                     "perf/steps_per_s":   interval_steps_per_s,
-                    "perf/samples_per_s": interval_steps_per_s * args.batch_size
+                    "perf/samples_per_s": interval_steps_per_s * args.batch_size * accum_steps
                                           * (dist.get_world_size() if use_ddp else 1),
                     "perf/eta_s":         eta_s,
                 }
@@ -890,15 +1058,12 @@ def main():
 
         # ── Checkpoint (main process only) ────────────────────────────────
         if _is_main and step % args.save_interval == 0:
-            save_checkpoint(model, optimizer, step, ckpt_dir, blocking=False)
-            # Also save norm_stats for eval.sh (runs inline, tiny file)
-            _save_norm_stats_with_ckpt(norm_stats, ckpt_dir / str(step))
+            save_checkpoint(model, optimizer, step, ckpt_dir, norm_stats=norm_stats, blocking=False)
 
     # ── Final checkpoint (main process only) ──────────────────────────────
     if _is_main:
         log.info("Training done.  Saving final checkpoint at step %d …", step)
-        save_checkpoint(model, optimizer, step, ckpt_dir, blocking=True)
-        _save_norm_stats_with_ckpt(norm_stats, ckpt_dir / str(step))
+        save_checkpoint(model, optimizer, step, ckpt_dir, norm_stats=norm_stats, blocking=True)
 
         if args.wandb_enabled:
             _wandb_finish()

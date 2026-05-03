@@ -46,6 +46,40 @@ import openpi.transforms as _transforms                          # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+# ── image float-cast transform ─────────────────────────────────────────────────
+# Bugfix: Observation.from_dict applies permute(0,3,1,2) for torch.uint8 images
+# (BHWC→BCHW), but preprocessing_pytorch.py then converts back to BHWC and
+# fails to convert BACK to BCHW at the end (the `if not is_channels_first` guard
+# is evaluated on the *original* shape, not the post-permute shape).
+# Avoiding torch.uint8 in the Observation entirely sidesteps this mismatch:
+# float32 images are left untouched by from_dict and preprocessing_pytorch
+# correctly converts them BHWC→BCHW at the end.
+
+import dataclasses as _dataclasses  # noqa: E402 (already stdlib, import here for clarity)
+
+@_dataclasses.dataclass(frozen=True)
+class _CastImagesToFloat(_transforms.DataTransformFn):
+    """Convert uint8 images in data["image"] to float32 in [-1, 1] range.
+
+    Inserted as the last input transform so that images arrive at
+    Observation.from_dict as float32 tensors, bypassing the torch.uint8 path
+    that incorrectly applies permute(0, 3, 1, 2).
+    """
+
+    def __call__(self, data: dict) -> dict:
+        if "image" not in data:
+            return data
+        new_images = {}
+        for k, v in data["image"].items():
+            arr = np.asarray(v)
+            if np.issubdtype(arr.dtype, np.unsignedinteger):
+                arr = arr.astype(np.float32) / 255.0 * 2.0 - 1.0
+            new_images[k] = arr
+        data = dict(data)
+        data["image"] = new_images
+        return data
+
+
 # ── domain_ids wrapper ─────────────────────────────────────────────────────────
 
 class _SoftVLAInferenceWrapper(nn.Module):
@@ -65,12 +99,17 @@ class _SoftVLAInferenceWrapper(nn.Module):
 
     def sample_actions(self, device: str, observation, **kwargs) -> torch.Tensor:
         domain_ids = torch.tensor([self.domain_id], dtype=torch.long, device=device)
-        return self.wrapped.sample_actions(
-            device,
-            observation,
-            domain_ids=domain_ids,
-            num_steps=self.num_steps,
-        )
+        # The model is loaded as bfloat16 but inputs (noise, state, timestep) arrive
+        # as float32.  autocast promotes matmul inputs to the model's native dtype
+        # automatically, avoiding the "Float vs BFloat16" runtime error.
+        device_type = device.split(":")[0]  # e.g. "cuda" from "cuda:0"
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            return self.wrapped.sample_actions(
+                device,
+                observation,
+                domain_ids=domain_ids,
+                num_steps=self.num_steps,
+            )
 
 
 # ── SoftVLA class ──────────────────────────────────────────────────────────────
@@ -144,9 +183,20 @@ class SoftVLA:
         pi0_cfg = train_config.model  # Pi0Config instance
 
         # Build SoftVLAConfig whose architecture fields mirror the Pi0Config.
-        # SoftVLA-specific fields (num_robots, soft_prompt_length, etc.) retain
-        # their defaults, which must match what was used during training.
+        # num_robots is inferred from the checkpoint weight shape so that
+        # fine-tuned checkpoints with an expanded SoftPromptHub load correctly.
+        # Use safe_open to read only the tensor shape (no full data load).
+        _emb_key = "soft_prompt_hub.embedding.weight"
+        with safetensors.torch.safe_open(weight_path, framework="pt", device="cpu") as _f:
+            _num_robots = (
+                _f.get_slice(_emb_key).get_shape()[0]
+                if _emb_key in _f.keys()
+                else SoftVLAConfig().num_robots
+            )
+        logger.info("SoftPromptHub num_robots inferred from checkpoint: %d", _num_robots)
+
         softvla_cfg = SoftVLAConfig(
+            num_robots=_num_robots,
             action_dim=pi0_cfg.action_dim,
             action_horizon=pi0_cfg.action_horizon,
             max_token_len=pi0_cfg.max_token_len,
@@ -171,6 +221,11 @@ class SoftVLA:
             raise FileNotFoundError(f"No asset subdirectory found in {assets_path}")
         assets_id = entries[0]
         norm_stats = _normalize.load(os.path.join(assets_path, assets_id))
+        # Older checkpoints saved with key "action" (singular); the transforms
+        # pipeline uses "actions" (plural).  Rename to avoid Unnormalize strict error.
+        if "action" in norm_stats and "actions" not in norm_stats:
+            norm_stats = dict(norm_stats)
+            norm_stats["actions"] = norm_stats.pop("action")
 
         # ── data / model transforms ─────────────────────────────────────────
         # Create transforms without loading norm_stats again (assets dir may not
@@ -186,6 +241,11 @@ class SoftVLA:
                 *data_config.data_transforms.inputs,
                 _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
                 *data_config.model_transforms.inputs,
+                # Must be last: convert uint8 images to float32 before Policy.infer
+                # batches them into torch tensors.  Avoids the torch.uint8 path in
+                # Observation.from_dict which incorrectly permutes BHWC→BCHW,
+                # causing a shape mismatch in SiGLIP's Conv2d (expects NCHW).
+                _CastImagesToFloat(),
             ],
             output_transforms=[
                 *data_config.model_transforms.outputs,
@@ -217,9 +277,10 @@ class SoftVLA:
                      Other state representations are also accepted; OpenPI
                      transforms zero-pad to the model action_dim.
         """
-        def _to_chw(img: np.ndarray) -> np.ndarray:
-            # RoboTwin returns HWC uint8; OpenPI's RoboTwin / Aloha input transforms
-            # expect CHW (matching PI05 conventions) and rearrange to HWC internally.
+        def _to_chw_uint8(img: np.ndarray) -> np.ndarray:
+            # RoboTwinEEInputs._convert_image 가 [C, H, W] uint8 을 기대함.
+            # (einops.rearrange "c h w -> h w c" 로 HWC로 변환 후 ResizeImages 전달)
+            # → 여기서는 단순히 HWC → CHW 변환만 하고 uint8 그대로 유지한다.
             arr = np.asarray(img)
 
             if arr.ndim == 4 and arr.shape[0] == 1:
@@ -228,17 +289,19 @@ class SoftVLA:
             if arr.ndim != 3:
                 return arr
 
-            if arr.shape[0] in (1, 3, 4):
-                return arr
+            # HWC → CHW (이미 CHW이면 그대로)
+            if arr.shape[-1] in (1, 3, 4) and arr.shape[0] not in (1, 3, 4):
+                arr = np.transpose(arr, (2, 0, 1))
 
-            if arr.shape[-1] in (1, 3, 4):
-                return np.transpose(arr, (2, 0, 1))
+            # float → uint8 변환이 필요하면 수행 (RoboTwin은 보통 uint8 반환)
+            if np.issubdtype(arr.dtype, np.floating):
+                arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
 
-            return arr
+            return arr  # CHW uint8
 
-        img_front = _to_chw(img_arr[0])
-        img_right = _to_chw(img_arr[1])
-        img_left  = _to_chw(img_arr[2])
+        img_front = _to_chw_uint8(img_arr[0])
+        img_right = _to_chw_uint8(img_arr[1])
+        img_left  = _to_chw_uint8(img_arr[2])
 
         self.observation_window = {
             "state": np.asarray(state, dtype=np.float32),
@@ -266,3 +329,31 @@ class SoftVLA:
         self.instruction = None
         self.observation_window = None
         logger.info("Observation window and instruction cleared.")
+
+    # ── dual-env server protocol helpers ──────────────────────────────────────
+
+    def reset_model(self) -> None:
+        """Alias for reset_observation_windows — called via socket by eval_policy_client."""
+        self.reset_observation_windows()
+
+    def get_softvla_step(self) -> int:
+        """Return the action chunk execution length (used by server protocol)."""
+        return self.softvla_step
+
+    def eval_step(self, obs: dict) -> dict:
+        """Single eval step for dual-env socket mode.
+
+        Args:
+            obs: dict with keys
+                 ``img_arr``    – list of three HWC uint8 ndarrays
+                 ``state``      – 1-D float ndarray (10-D right-only EE state)
+                 ``instruction``– language instruction string
+
+        Returns:
+            dict ``{"actions": ndarray (action_horizon, action_dim),
+                    "softvla_step": int}``
+        """
+        if self.observation_window is None:
+            self.set_language(obs["instruction"])
+        self.update_observation_window(obs["img_arr"], obs["state"])
+        return {"actions": self.get_action(), "softvla_step": self.softvla_step}

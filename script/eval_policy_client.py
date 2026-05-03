@@ -205,6 +205,10 @@ class ModelClient:
 
     def call(self, func_name=None, obs=None):
         response = self._send_recv({"cmd": func_name, "obs": obs})
+        if 'error' in response:
+            print(f"[server error] {response['error']}")
+            print(f"[server traceback]\n{response.get('traceback', '')}")
+            raise RuntimeError(response['error'])
         return response['res']
 
     def close(self):

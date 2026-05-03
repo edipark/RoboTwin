@@ -61,7 +61,7 @@ echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-export SOFTVLA_PYTHON="/home/yonsei_meat/workspace/sunghyun/Soft-VLA/.venv/bin/python"
+export SOFTVLA_PYTHON="/lustre/meat124/Soft-VLA/.venv/bin/python"
 PYTHON="${SOFTVLA_PYTHON}"
 echo -e "\033[36mPython: ${PYTHON}\033[0m"
 echo -e "\033[36mPython version: $(${PYTHON} -V 2>&1)\033[0m"

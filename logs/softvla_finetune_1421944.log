@@ -1,0 +1,25 @@
+Job ID       : 1421944
+Node         : node30
+GPUs assigned: 0,1,2,3
+Start time   : Sat May  2 04:00:33 KST 2026
+Working dir  : /lustre/meat124/Soft-VLA/third_party/RoboTwin
+
+[33mgpu id (to use): 0,1,2,3[0m
+[36mPython: /lustre/meat124/Soft-VLA/.venv/bin/python[0m
+[36mPython version: Python 3.11.14[0m
+2026-05-02 04:01:49.935341: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+Traceback (most recent call last):
+  File "/lustre/meat124/Soft-VLA/third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py", line 924, in <module>
+    main()
+  File "/lustre/meat124/Soft-VLA/third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py", line 593, in main
+    use_ddp, local_rank, device = _setup_ddp(args.ddp_backend)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/lustre/meat124/Soft-VLA/third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py", line 236, in _setup_ddp
+    torch.cuda.set_device(device)
+  File "/lustre/meat124/Soft-VLA/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py", line 529, in set_device
+    torch._C._cuda_setDevice(device)
+  File "/lustre/meat124/Soft-VLA/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py", line 372, in _lazy_init
+    torch._C._cuda_init()
+RuntimeError: Error parsing CachingAllocator settings, expected :
+
+End time: Sat May  2 04:02:28 KST 2026

@@ -1,0 +1,24 @@
+Job ID       : 1416584
+Node         : node02
+GPUs assigned: 0,1,2,3
+Start time   : Fri May  1 07:29:49 KST 2026
+Working dir  : /lustre/meat124/Soft-VLA/third_party/RoboTwin
+
+[33mgpu id (to use): 0,1,2,3[0m
+[36mPython: /lustre/meat124/Soft-VLA/.venv/bin/python[0m
+[36mPython version: Python 3.11.14[0m
+2026-05-01 07:31:03.002208: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+Traceback (most recent call last):
+  File "/lustre/meat124/Soft-VLA/third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py", line 924, in <module>
+    main()
+  File "/lustre/meat124/Soft-VLA/third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py", line 688, in main
+    _load_with_hub_expansion(model, src_weight, pretrained_num_robots=args.num_robots)
+  File "/lustre/meat124/Soft-VLA/third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py", line 265, in _load_with_hub_expansion
+    state_dict = safetensors.torch.load_file(src_weight)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/lustre/meat124/Soft-VLA/.venv/lib/python3.11/site-packages/safetensors/torch.py", line 313, in load_file
+    with safe_open(filename, framework="pt", device=device) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+safetensors_rust.SafetensorError: Error while deserializing header: MetadataIncompleteBuffer
+
+End time: Fri May  1 07:32:52 KST 2026
