@@ -108,6 +108,7 @@ def get_model(usr_args: dict) -> SoftVLA:
         softvla_step=int(usr_args["softvla_step"]),
         num_denoise_steps=int(usr_args.get("num_denoise_steps", 10)),
         domain_id=int(usr_args.get("domain_id", 0)),
+        num_robots=int(usr_args.get("num_robots", 8)),
     )
 
 

@@ -7,7 +7,7 @@
 #   bash policy/Soft-VLA/eval_double_env.sh \
 #       <task_name> <task_config> \
 #       <train_config_name> <model_name> \
-#       <checkpoint_id> <softvla_step> <seed> <gpu_id> [num_denoise_steps]
+#       <checkpoint_id> <softvla_step> <seed> <gpu_id> [num_denoise_steps] [num_robots]
 #
 # The Python interpreters can be overridden via environment variables:
 #   ROBOTWIN_PYTHON  – default: ~/anaconda3/envs/RoboTwin/bin/python
@@ -29,6 +29,7 @@ softvla_step=${6}
 seed=${7}
 gpu_id=${8}
 num_denoise_steps=${9:-10}
+num_robots=${10:-8}
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
@@ -65,10 +66,25 @@ echo -e "\033[33mUsing socket port: ${FREE_PORT}\033[0m"
 
 # ── launch policy server (venv Python, background) ────────────────────────────
 SERVER_LOG="/tmp/softvla_server_${FREE_PORT}.log"
+READY_FILE="/tmp/softvla_ready_${FREE_PORT}"
+rm -f "${READY_FILE}"
+
+echo -e "\033[32m[server] Clearing stale __pycache__ for policy modules...\033[0m"
+_REPO_ROOT_FOR_CACHE="$(cd "${_SCRIPT_DIR}/../../../.." && pwd)"
+find "${_REPO_ROOT_FOR_CACHE}" \
+    \( -path "*/policy/Soft-VLA/__pycache__" \
+    -o -path "*/src/softvla/__pycache__" \
+    -o -path "*/src/openpi/__pycache__" \
+    -o -path "*/src/openpi/policies/__pycache__" \
+    -o -path "*/src/openpi/training/__pycache__" \) \
+    2>/dev/null | xargs rm -rf
+
 echo -e "\033[32m[server] Launching policy_model_server (log: ${SERVER_LOG})...\033[0m"
 PYTHONWARNINGS=ignore::UserWarning \
+PYTHONDONTWRITEBYTECODE=1 \
 "${SOFTVLA_PYTHON}" script/policy_model_server.py \
     --port ${FREE_PORT} \
+    --ready-file "${READY_FILE}" \
     --config policy/${policy_name}/deploy_policy.yml \
     --overrides \
     --policy_name ${policy_name} \
@@ -79,6 +95,7 @@ PYTHONWARNINGS=ignore::UserWarning \
     --checkpoint_id ${checkpoint_id} \
     --softvla_step ${softvla_step} \
     --num_denoise_steps ${num_denoise_steps} \
+    --num_robots ${num_robots} \
     --seed ${seed} >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
@@ -86,8 +103,26 @@ SERVER_PID=$!
 tail -f "${SERVER_LOG}" &
 TAIL_PID=$!
 
-# Kill server and tail when this script exits (success or error)
-trap "echo -e '\033[31m[cleanup] Killing server (PID=${SERVER_PID})\033[0m'; kill ${SERVER_PID} 2>/dev/null; kill ${TAIL_PID} 2>/dev/null" EXIT
+# Kill server, tail, and ready file when this script exits (success or error)
+trap "echo -e '\033[31m[cleanup] Killing server (PID=${SERVER_PID})\033[0m'; kill ${SERVER_PID} 2>/dev/null; kill ${TAIL_PID} 2>/dev/null; rm -f '${READY_FILE}'" EXIT
+
+# ── wait for server to be ready ────────────────────────────────────────────────
+echo -e "\033[33m[server] Waiting for model to load (ready file: ${READY_FILE})...\033[0m"
+WAIT_TIMEOUT=1800  # 30 minutes max
+WAITED=0
+while [ ! -f "${READY_FILE}" ]; do
+    if ! kill -0 ${SERVER_PID} 2>/dev/null; then
+        echo -e "\033[31m[server] Server process died before becoming ready. Check log: ${SERVER_LOG}\033[0m" >&2
+        exit 1
+    fi
+    if [ ${WAITED} -ge ${WAIT_TIMEOUT} ]; then
+        echo -e "\033[31m[server] Timed out waiting for server to become ready after ${WAIT_TIMEOUT}s.\033[0m" >&2
+        exit 1
+    fi
+    sleep 2
+    WAITED=$((WAITED + 2))
+done
+echo -e "\033[32m[server] Server is ready! (waited ${WAITED}s)\033[0m"
 
 # ── launch simulator client (RoboTwin conda Python, foreground) ───────────────
 echo -e "\033[34m[client] Starting eval_policy_client...\033[0m"

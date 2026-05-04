@@ -35,6 +35,7 @@ import threading
 import time
 
 import numpy as np
+import tqdm
 import torch
 import torch.multiprocessing as torch_mp
 import torch.distributed as dist
@@ -527,7 +528,7 @@ def parse_args():
     p.add_argument("--batch_size",       type=int,   default=256)
     p.add_argument("--lr",               type=float, default=1e-4)
     p.add_argument("--warmup_steps",     type=int,   default=200)
-    p.add_argument("--save_interval",    type=int,   default=2_000)
+    p.add_argument("--save_interval",    type=int,   default=1_000)
     p.add_argument("--log_interval",     type=int,   default=10)
     p.add_argument("--num_workers",      type=int,   default=4)
 
@@ -653,8 +654,22 @@ def main():
 
     # ── Output checkpoint dir ────────────────────────────────────────────
     # All ranks create the directory (exist_ok=True is safe); no barrier needed.
-    ckpt_dir = pathlib.Path(_ROBOTWIN_ROOT) / "checkpoints" / "softvla_robotwin_ft" / args.exp_name
+    ckpt_dir = pathlib.Path(_ROBOTWIN_ROOT) / "policy" / "Soft-VLA" / "checkpoints" / "softvla_robotwin_ft" / args.exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    _metrics_file = None
+    if _is_main:
+        _log_path = ckpt_dir / "train.log"
+        _fh = logging.FileHandler(_log_path, mode="a")
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+        ))
+        logging.getLogger().addHandler(_fh)
+        log.info("Log file: %s", _log_path)
+
+        _metrics_path = ckpt_dir / "metrics.jsonl"
+        _metrics_file = open(_metrics_path, "a", buffering=1)  # line-buffered
+        log.info("Metrics file: %s", _metrics_path)
 
     # ── Norm stats ───────────────────────────────────────────────────────
     norm_stats, norm_stats_dir = _resolve_norm_stats(args)
@@ -883,6 +898,16 @@ def main():
     # Zero gradients before the very first accumulation cycle
     optimizer.zero_grad(set_to_none=True)
 
+    pbar = (
+        tqdm.tqdm(
+            total=total_finetune_steps,
+            initial=start_step,
+            desc="Finetune",
+            dynamic_ncols=True,
+        )
+        if _is_main else None
+    )
+
     while step < start_step + total_finetune_steps:
         # ── Infinite loader cycling ────────────────────────────────────────
         try:
@@ -1053,6 +1078,18 @@ def main():
                 }
                 metrics.update(_gpu_mem_stats())
                 _wandb_log(metrics, step=step)
+            if _metrics_file is not None:
+                _row = {
+                    "step":        step,
+                    "loss":        round(avg_loss, 6),
+                    "loss_std":    round(loss_std, 6),
+                    "grad_norm":   round(float(grad_norm.item()), 6),
+                    "lr":          current_lr,
+                    "epoch":       round(epoch, 4),
+                    "steps_per_s": round(interval_steps_per_s, 3),
+                    "eta_s":       round(eta_s, 1),
+                }
+                _metrics_file.write(json.dumps(_row) + "\n")
             loss_acc    = 0.0
             loss_sq_acc = 0.0
 
@@ -1060,10 +1097,20 @@ def main():
         if _is_main and step % args.save_interval == 0:
             save_checkpoint(model, optimizer, step, ckpt_dir, norm_stats=norm_stats, blocking=False)
 
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{loss_item:.4f}", lr=f"{current_lr:.2e}")
+
+    if pbar is not None:
+        pbar.close()
+
     # ── Final checkpoint (main process only) ──────────────────────────────
     if _is_main:
         log.info("Training done.  Saving final checkpoint at step %d …", step)
         save_checkpoint(model, optimizer, step, ckpt_dir, norm_stats=norm_stats, blocking=True)
+
+        if _metrics_file is not None:
+            _metrics_file.close()
 
         if args.wandb_enabled:
             _wandb_finish()

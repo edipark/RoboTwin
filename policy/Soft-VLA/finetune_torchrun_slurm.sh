@@ -56,10 +56,10 @@ cd "${REPO_ROOT}"
     --stage1_steps 500 \
     --stage2_steps 2000 \
     --stage2_lr 1e-4 \
-    --batch_size 16 \
-    --gradient_accumulation_steps 4 \
+    --batch_size 8 \
+    --gradient_accumulation_steps 8 \
     --exp_name softvla_robotwin_finetune \
-    --phase2_checkpoint ./checkpoints/p2_xvla_action_decoder_v1/10000 \
+    --phase2_checkpoint ./checkpoints/p2_bs256_xdomain_ncetemp0.2_maxcdf0.1_fixed/best \
     --wandb_enabled
 
 echo ""

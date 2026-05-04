@@ -46,40 +46,6 @@ import openpi.transforms as _transforms                          # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-# ── image float-cast transform ─────────────────────────────────────────────────
-# Bugfix: Observation.from_dict applies permute(0,3,1,2) for torch.uint8 images
-# (BHWC→BCHW), but preprocessing_pytorch.py then converts back to BHWC and
-# fails to convert BACK to BCHW at the end (the `if not is_channels_first` guard
-# is evaluated on the *original* shape, not the post-permute shape).
-# Avoiding torch.uint8 in the Observation entirely sidesteps this mismatch:
-# float32 images are left untouched by from_dict and preprocessing_pytorch
-# correctly converts them BHWC→BCHW at the end.
-
-import dataclasses as _dataclasses  # noqa: E402 (already stdlib, import here for clarity)
-
-@_dataclasses.dataclass(frozen=True)
-class _CastImagesToFloat(_transforms.DataTransformFn):
-    """Convert uint8 images in data["image"] to float32 in [-1, 1] range.
-
-    Inserted as the last input transform so that images arrive at
-    Observation.from_dict as float32 tensors, bypassing the torch.uint8 path
-    that incorrectly applies permute(0, 3, 1, 2).
-    """
-
-    def __call__(self, data: dict) -> dict:
-        if "image" not in data:
-            return data
-        new_images = {}
-        for k, v in data["image"].items():
-            arr = np.asarray(v)
-            if np.issubdtype(arr.dtype, np.unsignedinteger):
-                arr = arr.astype(np.float32) / 255.0 * 2.0 - 1.0
-            new_images[k] = arr
-        data = dict(data)
-        data["image"] = new_images
-        return data
-
-
 # ── domain_ids wrapper ─────────────────────────────────────────────────────────
 
 class _SoftVLAInferenceWrapper(nn.Module):
@@ -99,11 +65,7 @@ class _SoftVLAInferenceWrapper(nn.Module):
 
     def sample_actions(self, device: str, observation, **kwargs) -> torch.Tensor:
         domain_ids = torch.tensor([self.domain_id], dtype=torch.long, device=device)
-        # The model is loaded as bfloat16 but inputs (noise, state, timestep) arrive
-        # as float32.  autocast promotes matmul inputs to the model's native dtype
-        # automatically, avoiding the "Float vs BFloat16" runtime error.
-        device_type = device.split(":")[0]  # e.g. "cuda" from "cuda:0"
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
             return self.wrapped.sample_actions(
                 device,
                 observation,
@@ -145,6 +107,7 @@ class SoftVLA:
         softvla_step: int,
         num_denoise_steps: int = 10,
         domain_id: int = 0,
+        num_robots: int = 8,
     ):
         self.softvla_step = softvla_step
 
@@ -183,30 +146,46 @@ class SoftVLA:
         pi0_cfg = train_config.model  # Pi0Config instance
 
         # Build SoftVLAConfig whose architecture fields mirror the Pi0Config.
-        # num_robots is inferred from the checkpoint weight shape so that
-        # fine-tuned checkpoints with an expanded SoftPromptHub load correctly.
-        # Use safe_open to read only the tensor shape (no full data load).
-        _emb_key = "soft_prompt_hub.embedding.weight"
-        with safetensors.torch.safe_open(weight_path, framework="pt", device="cpu") as _f:
-            _num_robots = (
-                _f.get_slice(_emb_key).get_shape()[0]
-                if _emb_key in _f.keys()
-                else SoftVLAConfig().num_robots
-            )
-        logger.info("SoftPromptHub num_robots inferred from checkpoint: %d", _num_robots)
-
+        # SoftVLA-specific fields (num_robots, soft_prompt_length, etc.) retain
+        # their defaults, which must match what was used during training.
         softvla_cfg = SoftVLAConfig(
-            num_robots=_num_robots,
             action_dim=pi0_cfg.action_dim,
             action_horizon=pi0_cfg.action_horizon,
             max_token_len=pi0_cfg.max_token_len,
             pi05=True,
             paligemma_variant=pi0_cfg.paligemma_variant,
             action_expert_variant=pi0_cfg.action_expert_variant,
+            num_robots=num_robots,
         )
 
         # ── load SoftVLAPytorch weights ─────────────────────────────────────
-        logger.info("Loading SoftVLAPytorch from %s", weight_path)
+        # Auto-detect num_robots from checkpoint to avoid shape mismatch.
+        # The explicit num_robots arg is used as a fallback when the key is absent.
+        import safetensors as _safetensors_meta
+        with _safetensors_meta.safe_open(weight_path, framework="pt", device="cpu") as _f:
+            _keys = _f.keys()
+        if "soft_prompt_hub.embedding.weight" in _keys:
+            import safetensors.torch as _st
+            _hub_tensor = _st.load_file(weight_path, device="cpu")["soft_prompt_hub.embedding.weight"]
+            ckpt_num_robots = _hub_tensor.shape[0]
+            if ckpt_num_robots != num_robots:
+                logger.warning(
+                    "num_robots mismatch: checkpoint has %d, argument was %d. "
+                    "Using checkpoint value %d.",
+                    ckpt_num_robots, num_robots, ckpt_num_robots,
+                )
+                num_robots = ckpt_num_robots
+                softvla_cfg = SoftVLAConfig(
+                    action_dim=pi0_cfg.action_dim,
+                    action_horizon=pi0_cfg.action_horizon,
+                    max_token_len=pi0_cfg.max_token_len,
+                    pi05=True,
+                    paligemma_variant=pi0_cfg.paligemma_variant,
+                    action_expert_variant=pi0_cfg.action_expert_variant,
+                    num_robots=num_robots,
+                )
+
+        logger.info("Loading SoftVLAPytorch (num_robots=%d) from %s", num_robots, weight_path)
         raw_model = SoftVLAPytorch(softvla_cfg)
         safetensors.torch.load_model(raw_model, weight_path, strict=False)
         raw_model.to(torch.bfloat16)
@@ -221,11 +200,6 @@ class SoftVLA:
             raise FileNotFoundError(f"No asset subdirectory found in {assets_path}")
         assets_id = entries[0]
         norm_stats = _normalize.load(os.path.join(assets_path, assets_id))
-        # Older checkpoints saved with key "action" (singular); the transforms
-        # pipeline uses "actions" (plural).  Rename to avoid Unnormalize strict error.
-        if "action" in norm_stats and "actions" not in norm_stats:
-            norm_stats = dict(norm_stats)
-            norm_stats["actions"] = norm_stats.pop("action")
 
         # ── data / model transforms ─────────────────────────────────────────
         # Create transforms without loading norm_stats again (assets dir may not
@@ -238,14 +212,16 @@ class SoftVLA:
             wrapped,
             transforms=[
                 _transforms.InjectDefaultPrompt(None),
-                *data_config.data_transforms.inputs,
+                # data_config.data_transforms.inputs (RoboTwinEEInputs) is intentionally
+                # omitted here.  update_observation_window() pre-converts images to
+                # HWC float32 [-1, 1] with the correct key names, so the
+                # CHW→HWC conversion and key remapping that RoboTwinEEInputs performs
+                # are not needed.  Skipping it also ensures images arrive at
+                # Observation.from_dict() as torch.float32 (not torch.uint8), which
+                # avoids from_dict's permute(0,3,1,2) that would put them in BCHW and
+                # subsequently break preprocessing_pytorch's is_channels_first logic.
                 _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
                 *data_config.model_transforms.inputs,
-                # Must be last: convert uint8 images to float32 before Policy.infer
-                # batches them into torch tensors.  Avoids the torch.uint8 path in
-                # Observation.from_dict which incorrectly permutes BHWC→BCHW,
-                # causing a shape mismatch in SiGLIP's Conv2d (expects NCHW).
-                _CastImagesToFloat(),
             ],
             output_transforms=[
                 *data_config.model_transforms.outputs,
@@ -277,38 +253,48 @@ class SoftVLA:
                      Other state representations are also accepted; OpenPI
                      transforms zero-pad to the model action_dim.
         """
-        def _to_chw_uint8(img: np.ndarray) -> np.ndarray:
-            # RoboTwinEEInputs._convert_image 가 [C, H, W] uint8 을 기대함.
-            # (einops.rearrange "c h w -> h w c" 로 HWC로 변환 후 ResizeImages 전달)
-            # → 여기서는 단순히 HWC → CHW 변환만 하고 uint8 그대로 유지한다.
-            arr = np.asarray(img)
+        from openpi_client import image_tools as _image_tools  # noqa: PLC0415
 
+        def _prepare_image(img: np.ndarray) -> np.ndarray:
+            """Resize to 224×224 and normalise to float32 [-1, 1] in HWC layout.
+
+            Providing float32 (not uint8) images ensures that Observation.from_dict()
+            skips its torch.uint8 branch (which would permute BHWC→BCHW and break
+            preprocessing_pytorch’s is_channels_first logic).
+            """
+            arr = np.asarray(img)
             if arr.ndim == 4 and arr.shape[0] == 1:
                 arr = arr[0]
+            # Ensure uint8 HWC for PIL-based resize
+            if arr.dtype != np.uint8:
+                if np.issubdtype(arr.dtype, np.floating):
+                    arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
+                else:
+                    arr = arr.astype(np.uint8)
+            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+                arr = np.transpose(arr, (1, 2, 0))  # CHW → HWC
+            # Resize to 224×224 with padding (PIL expects / returns uint8 HWC)
+            arr = _image_tools.resize_with_pad(arr, 224, 224)
+            # Normalise to float32 [-1, 1]
+            return arr.astype(np.float32) / 255.0 * 2.0 - 1.0
 
-            if arr.ndim != 3:
-                return arr
-
-            # HWC → CHW (이미 CHW이면 그대로)
-            if arr.shape[-1] in (1, 3, 4) and arr.shape[0] not in (1, 3, 4):
-                arr = np.transpose(arr, (2, 0, 1))
-
-            # float → uint8 변환이 필요하면 수행 (RoboTwin은 보통 uint8 반환)
-            if np.issubdtype(arr.dtype, np.floating):
-                arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
-
-            return arr  # CHW uint8
-
-        img_front = _to_chw_uint8(img_arr[0])
-        img_right = _to_chw_uint8(img_arr[1])
-        img_left  = _to_chw_uint8(img_arr[2])
+        img_front = _prepare_image(img_arr[0])
+        img_right = _prepare_image(img_arr[1])
+        img_left  = _prepare_image(img_arr[2])
 
         self.observation_window = {
             "state": np.asarray(state, dtype=np.float32),
-            "images": {
-                "cam_high":        img_front,
-                "cam_left_wrist":  img_left,
-                "cam_right_wrist": img_right,
+            # Use the key names that preprocessing_pytorch / Observation expect
+            # directly, bypassing RoboTwinEEInputs remapping.
+            "image": {
+                "base_0_rgb":        img_front,
+                "left_wrist_0_rgb":  img_left,
+                "right_wrist_0_rgb": img_right,
+            },
+            "image_mask": {
+                "base_0_rgb":        np.True_,
+                "left_wrist_0_rgb":  np.True_,
+                "right_wrist_0_rgb": np.True_,
             },
             "prompt": self.instruction,
         }

@@ -71,7 +71,7 @@ def json_to_numpy(json_str: str) -> Any:
 
 # --------------------- Model Server Implementation ---------------------
 class ModelServer:
-    def __init__(self, model, host='localhost', port=None):
+    def __init__(self, model, host='localhost', port=None, ready_file=None):
         self.model = model
         self.host = host
         self.port = port
@@ -79,6 +79,7 @@ class ModelServer:
         self.running = False
         self.wait_interval = 10
         self.client_threads = []
+        self.ready_file = ready_file
 
     def start(self):
         """Start the model server and listen for incoming client connections"""
@@ -90,6 +91,12 @@ class ModelServer:
 
         print(f"🚀 Model server started on {self.host}:{self.port}")
         print("🔄 Server is waiting for client connections...")
+
+        # Signal readiness so the client process can start immediately
+        if self.ready_file:
+            with open(self.ready_file, 'w') as _f:
+                _f.write(str(self.port))
+            print(f"✅ Ready file written: {self.ready_file}")
 
         self._accept_connections()
 
@@ -219,13 +226,18 @@ def main(usr_args):
     # Extract basic arguments
     policy_name = usr_args['policy_name']
     port = usr_args.get('port')
+    ready_file = usr_args.get('ready_file')
+
+    # Remove ready file from a previous run if it exists
+    if ready_file and os.path.exists(ready_file):
+        os.remove(ready_file)
 
     # Instantiate model
     get_model = eval_function_decorator(policy_name, 'get_model')
     model = get_model(usr_args)
 
     # Start server in background thread
-    server = ModelServer(model, port=port)
+    server = ModelServer(model, port=port, ready_file=ready_file)
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
 
@@ -237,12 +249,17 @@ def main(usr_args):
         print("\n🛑 Shutting down server...")
         server.stop()
         thread.join()
+    finally:
+        if ready_file and os.path.exists(ready_file):
+            os.remove(ready_file)
 
 
 def parse_args_and_config():
     """Parse CLI args and YAML config, merge overrides"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, help='Port for ModelServer (optional)')
+    parser.add_argument('--ready-file', type=str, default=None,
+                        help='Path to write when server is ready (optional)')
     parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
     parser.add_argument('--overrides', nargs=argparse.REMAINDER,
                         help='Override config values')
@@ -252,6 +269,7 @@ def parse_args_and_config():
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     cfg['port'] = args.port
+    cfg['ready_file'] = args.ready_file
 
     # Parse overrides: --key value pairs
     if args.overrides:
