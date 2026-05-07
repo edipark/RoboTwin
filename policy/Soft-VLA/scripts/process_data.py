@@ -161,11 +161,17 @@ def data_transform(path, episode_num, save_path):
             if j != 0:
                 actions.append(state)
 
+        qpos_arr    = np.array(qpos,    dtype=np.float32)   # [T-1, 10]
+        actions_arr = np.array(actions, dtype=np.float32)   # [T-1, 10]
+        # Store absolute xyz. Chunk-level delta (all horizon steps relative to
+        # state_t) is applied at dataset load time in RoboTwinDataset.__getitem__,
+        # matching DeltaActions in RoboTwinEEDataConfig (openpi/transforms.py).
+
         hdf5_path = os.path.join(ep_save_dir, f"episode_{i}.hdf5")
         with h5py.File(hdf5_path, "w") as f:
-            f.create_dataset("action", data=np.array(actions, dtype=np.float32))
+            f.create_dataset("action", data=actions_arr)
             obs = f.create_group("observations")
-            obs.create_dataset("qpos", data=np.array(qpos, dtype=np.float32))
+            obs.create_dataset("qpos", data=qpos_arr)
             f.attrs["action_format"] = ACTION_FORMAT_TAG
             f.attrs["action_layout"] = ACTION_LAYOUT_TAG
             f.attrs["action_dim"] = int(RIGHT_ONLY_ACTION_DIM)

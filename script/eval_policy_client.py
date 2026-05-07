@@ -461,6 +461,35 @@ def eval_policy(task_name,
             )
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
 
+            # Observer camera (320×240, always present in the scene)
+            ffmpeg_observer = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pixel_format",
+                    "rgb24",
+                    "-video_size",
+                    "320x240",
+                    "-framerate",
+                    "10",
+                    "-i",
+                    "-",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vcodec",
+                    "libx264",
+                    "-crf",
+                    "23",
+                    f"{TASK_ENV.eval_video_path}/episode{TASK_ENV.test_num}_observer.mp4",
+                ],
+                stdin=subprocess.PIPE,
+            )
+            TASK_ENV._set_eval_video_ffmpeg_observer(ffmpeg_observer)
+
         succ = False
         model.call(func_name='reset_model')
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
@@ -472,6 +501,7 @@ def eval_policy(task_name,
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
+            TASK_ENV._del_eval_video_ffmpeg_observer()
 
         if succ:
             TASK_ENV.suc += 1

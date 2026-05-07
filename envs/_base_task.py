@@ -589,6 +589,15 @@ class Base_Task(gym.Env):
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
 
+    def _set_eval_video_ffmpeg_observer(self, ffmpeg):
+        self.eval_video_ffmpeg_observer = ffmpeg
+
+    def _del_eval_video_ffmpeg_observer(self):
+        if hasattr(self, 'eval_video_ffmpeg_observer') and self.eval_video_ffmpeg_observer:
+            self.eval_video_ffmpeg_observer.stdin.close()
+            self.eval_video_ffmpeg_observer.wait()
+            del self.eval_video_ffmpeg_observer
+
     def close_env(self, clear_cache=False):
         if clear_cache:
             # for actor in self.scene.get_all_actors():
@@ -1503,6 +1512,8 @@ class Base_Task(gym.Env):
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+            if hasattr(self, 'eval_video_ffmpeg_observer') and self.eval_video_ffmpeg_observer:
+                self.eval_video_ffmpeg_observer.stdin.write(self.cameras.get_observer_rgb().tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1698,6 +1709,8 @@ class Base_Task(gym.Env):
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                    if hasattr(self, 'eval_video_ffmpeg_observer') and self.eval_video_ffmpeg_observer:
+                        self.eval_video_ffmpeg_observer.stdin.write(self.cameras.get_observer_rgb().tobytes())
                 return
 
         self._update_render()
@@ -1785,6 +1798,8 @@ class Base_Task(gym.Env):
                     self.eval_video_ffmpeg.stdin.write(
                         self.now_obs["observation"]["head_camera"]["rgb"].tobytes()
                     )
+                    if hasattr(self, 'eval_video_ffmpeg_observer') and self.eval_video_ffmpeg_observer:
+                        self.eval_video_ffmpeg_observer.stdin.write(self.cameras.get_observer_rgb().tobytes())
                 return
 
         self._update_render()

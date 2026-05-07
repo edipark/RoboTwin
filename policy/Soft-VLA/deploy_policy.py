@@ -146,6 +146,13 @@ def eval(TASK_ENV, model, observation: dict) -> None:  # noqa: A001
 
     # ── execute each action step (right-only EE: xyz + rot6d + gripper) ─────
     from envs.utils.rot6d import RIGHT_ONLY_ACTION_DIM  # lazy: needs transforms3d (conda only)
+    # Debug: print first action to verify delta→absolute conversion
+    import logging as _logging
+    _dbg = _logging.getLogger(__name__)
+    _dbg.info("[eval] state_xyz=%.4f,%.4f,%.4f | action[0]_xyz=%.4f,%.4f,%.4f | chunk_shape=%s",
+              input_state[0], input_state[1], input_state[2],
+              actions[0, 0], actions[0, 1], actions[0, 2],
+              actions.shape)
     for action in actions[:softvla_step]:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.shape[0] < RIGHT_ONLY_ACTION_DIM:

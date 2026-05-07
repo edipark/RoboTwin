@@ -1,0 +1,51 @@
+# Right-arm-only demo collection config.
+#
+# Same as ``demo_clean.yml`` but with ``active_arms: right`` so the left arm
+# is held at its current joint targets every control step in the data
+# collection pipeline.  Use this when collecting demos for a single-arm task
+# on a dual-arm embodiment (e.g. ARX-X5) where Soft-VLA fine-tuning
+# expects right-only 10-D EE actions.
+#
+# Pair with the right-only Soft-VLA pipeline:
+#   1. python script/collect_data.py <task_name> demo_clean_right
+#   2. cd policy/Soft-VLA && python scripts/process_data.py <task_name> demo_clean_right <N>
+#   3. bash policy/Soft-VLA/finetune.sh <task_name> demo_clean_right ...
+#   4. bash policy/Soft-VLA/eval.sh    <task_name> demo_clean_right ...
+render_freq: 0
+episode_num: 50
+use_seed: false
+save_freq: 15
+embodiment: [ARX-X5, ARX-X5, 0.7]
+language_num: 100
+# Restrict actuation to the right arm during take_action / take_dense_action.
+# Honoured by envs/_base_task.py (action_type in {qpos, ee}).
+active_arms: right
+domain_randomization:
+  random_background: false
+  cluttered_table: false
+  clean_background_rate: 1
+  random_head_camera_dis: 0
+  random_table_height: 0
+  random_light: false
+  crazy_random_light_rate: 0
+camera:
+  head_camera_type: D435
+  wrist_camera_type: D435
+  collect_head_camera: true
+  collect_wrist_camera: true
+data_type:
+  rgb: true
+  third_view: false
+  depth: false
+  pointcloud: false
+  observer: false
+  endpose: true
+  qpos: true
+  mesh_segmentation: false
+  actor_segmentation: false
+pcd_down_sample_num: 1024
+pcd_crop: true
+save_path: ./data
+clear_cache_freq: 5
+collect_data: true
+eval_video_log: true

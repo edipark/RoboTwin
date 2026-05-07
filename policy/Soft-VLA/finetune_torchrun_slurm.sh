@@ -26,6 +26,16 @@ echo "Start time   : $(date)"
 echo "Working dir  : $(pwd)"
 echo ""
 
+# ── Args: TASK_NAME  TASK_CONFIG  EXP_NAME ────────────────────────────────────
+# 사용 예:
+#   sbatch -p suma_a6000 --gres=gpu:4 \
+#       policy/Soft-VLA/finetune_torchrun_slurm.sh \
+#       beat_block_hammer  demo_clean_right  robotwin_beat_b64
+TASK_NAME="${1:?Usage: $0 <task_name> <task_config> <exp_name>}"
+TASK_CONFIG="${2:?Usage: $0 <task_name> <task_config> <exp_name>}"
+EXP_NAME="${3:?Usage: $0 <task_name> <task_config> <exp_name>}"
+CHECKPOINT_PATH="${4:-./checkpoints/p2_2n_s4_bs384_xdomain_ncetemp0.2_maxcdf0.1_trans_topo2048/best}"
+
 # ── Repo root (이 스크립트는 RoboTwin root에서 sbatch) ────────────────────────
 REPO_ROOT="/lustre/meat124/Soft-VLA"
 PYTHON="${REPO_ROOT}/.venv/bin/python"
@@ -35,7 +45,7 @@ echo "Python version: $(${PYTHON} -V 2>&1)"
 
 # ── Environment ───────────────────────────────────────────────────────────────
 export PYTHONPATH="${REPO_ROOT}/third_party/RoboTwin/policy/Soft-VLA/src:${REPO_ROOT}/src"
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="0"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8
@@ -47,19 +57,18 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 cd "${REPO_ROOT}"
 
 "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc_per_node=4 \
+    --standalone --nnodes=1 --nproc_per_node=1 \
     --master_port 29502 \
     third_party/RoboTwin/policy/Soft-VLA/scripts/finetune.py \
-    --task_name beat_block_hammer \
-    --task_config demo_clean_right \
+    --task_name "${TASK_NAME}" \
+    --task_config "${TASK_CONFIG}" \
     --domain_id 8 \
-    --stage1_steps 500 \
-    --stage2_steps 2000 \
+    --stage1_steps 400 \
+    --stage2_steps 600 \
     --stage2_lr 1e-4 \
-    --batch_size 8 \
-    --gradient_accumulation_steps 8 \
-    --exp_name softvla_robotwin_finetune \
-    --phase2_checkpoint ./checkpoints/p2_bs256_xdomain_ncetemp0.2_maxcdf0.1_fixed/best \
+    --batch_size 32 \
+    --exp_name "${EXP_NAME}" \
+    --phase2_checkpoint "${CHECKPOINT_PATH}" \
     --wandb_enabled
 
 echo ""

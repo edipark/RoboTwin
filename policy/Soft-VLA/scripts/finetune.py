@@ -361,7 +361,7 @@ def _resolve_norm_stats(args) -> tuple[dict, str]:
             f"{args.task_name}-{args.task_config}-{args.expert_data_num}",
         )
         log.info("Computing norm stats from %s → %s", processed_dir, auto_dir)
-        compute_norm_stats(processed_dir, auto_dir)
+        compute_norm_stats(processed_dir, auto_dir, action_horizon=args.action_horizon)
 
     stats = _normalize.load(auto_dir)
     log.info("Loaded norm stats from %s", auto_dir)

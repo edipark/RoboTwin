@@ -7,7 +7,11 @@
 #   bash policy/Soft-VLA/eval_double_env.sh \
 #       <task_name> <task_config> \
 #       <train_config_name> <model_name> \
-#       <checkpoint_id> <softvla_step> <seed> <gpu_id> [num_denoise_steps] [num_robots]
+#       <checkpoint_id> <softvla_step> <seed> <gpu_id> \
+#       [domain_id] [num_denoise_steps] [num_robots]
+#
+# domain_id: SoftPromptHub embodiment index used during fine-tuning (default 0).
+#            Must match the --domain_id used in finetune.sh (e.g. 8 for RoboTwin).
 #
 # The Python interpreters can be overridden via environment variables:
 #   ROBOTWIN_PYTHON  – default: ~/anaconda3/envs/RoboTwin/bin/python
@@ -17,7 +21,7 @@
 #   bash policy/Soft-VLA/eval_double_env.sh \
 #       beat_block_hammer demo_clean \
 #       softvla_robotwin_ft robotwin_finetune \
-#       10000 16 42 0
+#       10000 16 42 0 8
 
 policy_name=Soft-VLA
 task_name=${1}
@@ -28,8 +32,9 @@ checkpoint_id=${5}
 softvla_step=${6}
 seed=${7}
 gpu_id=${8}
-num_denoise_steps=${9:-10}
-num_robots=${10:-8}
+domain_id=${9:-0}
+num_denoise_steps=${10:-10}
+num_robots=${11:-8}
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
@@ -96,6 +101,7 @@ PYTHONDONTWRITEBYTECODE=1 \
     --softvla_step ${softvla_step} \
     --num_denoise_steps ${num_denoise_steps} \
     --num_robots ${num_robots} \
+    --domain_id ${domain_id} \
     --seed ${seed} >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
