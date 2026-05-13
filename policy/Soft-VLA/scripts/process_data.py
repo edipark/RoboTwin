@@ -85,10 +85,18 @@ def load_hdf5(dataset_path):
 
 
 def images_encoding(imgs):
+    """Encode a list of RGB numpy arrays as JPEG bytes.
+
+    cv2.imencode treats the input as BGR, so we convert RGB -> BGR first to
+    ensure the stored JPEG has correct visual colors.  This makes the output
+    compatible with the training-side decode_image_from_bytes pipeline which
+    calls cv2.imdecode (returns BGR) + cv2.COLOR_BGR2RGB = correct RGB.
+    """
     encode_data = []
     max_len = 0
     for i in range(len(imgs)):
-        success, encoded_image = cv2.imencode(".jpg", imgs[i])
+        bgr_img = cv2.cvtColor(imgs[i], cv2.COLOR_RGB2BGR)
+        success, encoded_image = cv2.imencode(".jpg", bgr_img)
         jpeg_data = encoded_image.tobytes()
         encode_data.append(jpeg_data)
         max_len = max(max_len, len(jpeg_data))
@@ -141,20 +149,27 @@ def data_transform(path, episode_num, save_path):
                 qpos.append(state)
 
                 camera_high_bits = image_dict["head_camera"][j]
-                camera_high = cv2.imdecode(
-                    np.frombuffer(camera_high_bits, np.uint8), cv2.IMREAD_COLOR
+                # Raw HDF5 images are JPEG-encoded by pkl2hdf5 using cv2 (BGR convention).
+                # Decode to BGR, then immediately convert to RGB so all stored images
+                # are in RGB order — consistent with what the simulator renders and
+                # what the training-side decode_image_from_bytes now expects.
+                camera_high = cv2.cvtColor(
+                    cv2.imdecode(np.frombuffer(camera_high_bits, np.uint8), cv2.IMREAD_COLOR),
+                    cv2.COLOR_BGR2RGB,
                 )
                 cam_high.append(cv2.resize(camera_high, (640, 480)))
 
                 camera_right_bits = image_dict["right_camera"][j]
-                camera_right = cv2.imdecode(
-                    np.frombuffer(camera_right_bits, np.uint8), cv2.IMREAD_COLOR
+                camera_right = cv2.cvtColor(
+                    cv2.imdecode(np.frombuffer(camera_right_bits, np.uint8), cv2.IMREAD_COLOR),
+                    cv2.COLOR_BGR2RGB,
                 )
                 cam_right_wrist.append(cv2.resize(camera_right, (640, 480)))
 
                 camera_left_bits = image_dict["left_camera"][j]
-                camera_left = cv2.imdecode(
-                    np.frombuffer(camera_left_bits, np.uint8), cv2.IMREAD_COLOR
+                camera_left = cv2.cvtColor(
+                    cv2.imdecode(np.frombuffer(camera_left_bits, np.uint8), cv2.IMREAD_COLOR),
+                    cv2.COLOR_BGR2RGB,
                 )
                 cam_left_wrist.append(cv2.resize(camera_left, (640, 480)))
 

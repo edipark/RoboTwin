@@ -14,7 +14,7 @@ class stack_blocks_two(Base_Task):
         block_pose_lst = []
         for i in range(2):
             block_pose = rand_pose(
-                xlim=[-0.28, 0.28],
+                xlim=[0, 0.28], # Right half biased
                 ylim=[-0.08, 0.05],
                 zlim=[0.741 + block_half_size],
                 qpos=[1, 0, 0, 0],
@@ -32,7 +32,7 @@ class stack_blocks_two(Base_Task):
             while (abs(block_pose.p[0]) < 0.05 or np.sum(pow(block_pose.p[:2] - np.array([0, -0.1]), 2)) < 0.0225
                    or not check_block_pose(block_pose)):
                 block_pose = rand_pose(
-                    xlim=[-0.28, 0.28],
+                    xlim=[0, 0.28], # Right half biased
                     ylim=[-0.08, 0.05],
                     zlim=[0.741 + block_half_size],
                     qpos=[1, 0, 0, 0],
@@ -118,5 +118,8 @@ class stack_blocks_two(Base_Task):
         block2_pose = self.block2.get_pose().p
         eps = [0.025, 0.025, 0.012]
 
+        gripper_ok = self.is_right_gripper_open()
+        if getattr(self, "active_arms", "both") != "right":
+            gripper_ok = gripper_ok and self.is_left_gripper_open()
         return (np.all(abs(block2_pose - np.array(block1_pose[:2].tolist() + [block1_pose[2] + 0.05])) < eps)
-                and self.is_left_gripper_open() and self.is_right_gripper_open())
+                and gripper_ok)
