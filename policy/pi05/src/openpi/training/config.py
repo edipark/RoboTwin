@@ -339,17 +339,22 @@ class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
         gripper(1)     = absolute next-step gripper
     No additional delta transform is applied at training time.
     StepDeltaIntegrateEEActions in outputs recovers absolute EE poses for inference.
+
+    To train with the head camera only, override ``repack_transforms`` and omit
+    the wrist-camera keys — same pattern as ``LeRobotAlohaDataConfig``.
     """
 
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
+    # Override to control which cameras are used (default: all 3 cameras).
+    # Omit observation/wrist_image and observation/wrist_image_left to train
+    # with the head camera only.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
                         "observation/image":            "image",
                         "observation/wrist_image":      "wrist_image",
-                        "observation/wrist_image_left": "wrist_image_left",
+                        # "observation/wrist_image_left": "wrist_image_left",
                         "observation/state":            "state",
                         "actions":                      "actions",
                         "prompt":                       "prompt",
@@ -357,7 +362,10 @@ class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
                 )
             ]
         )
+    )
 
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Data is already step-delta; no additional delta transform at training time.
         # StepDeltaIntegrateEEActions recovers absolute EE poses during inference.
         data_transforms = _transforms.Group(
@@ -374,7 +382,7 @@ class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
+            repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )

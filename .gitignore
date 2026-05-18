@@ -16,7 +16,7 @@ eval_video/
 # eval result
 eval_result/
 logs/
-.cache-home/**
+.cache-home/
 
 # Code Generation
 assets/*

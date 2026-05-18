@@ -216,26 +216,28 @@ class LeRobotRoboTwinEEInputs(transforms.DataTransformFn):
         actions                       — (action_horizon, 10) float32  [training only]
         prompt                        — str  [optional]
 
-    All three image masks are set to True.
+    Wrist cameras are included automatically when ``observation/wrist_image`` and
+    ``observation/wrist_image_left`` are present in ``data``. Omit them from the
+    upstream RepackTransform to train with the head camera only.
     """
 
     def __call__(self, data: dict) -> dict:
-        base_image        = _parse_image_hwc(data["observation/image"])
-        right_wrist_image = _parse_image_hwc(data["observation/wrist_image"])
-        left_wrist_image  = _parse_image_hwc(data["observation/wrist_image_left"])
+        base_image = _parse_image_hwc(data["observation/image"])
+
+        image: dict = {"base_0_rgb": base_image}
+        image_mask: dict = {"base_0_rgb": np.True_}
+
+        if "observation/wrist_image" in data:
+            image["right_wrist_0_rgb"] = _parse_image_hwc(data["observation/wrist_image"])
+            image_mask["right_wrist_0_rgb"] = np.True_
+        if "observation/wrist_image_left" in data:
+            image["left_wrist_0_rgb"]  = _parse_image_hwc(data["observation/wrist_image_left"])
+            image_mask["left_wrist_0_rgb"]  = np.True_
 
         out: dict = {
             "state": np.asarray(data["observation/state"], dtype=np.float32),
-            "image": {
-                "base_0_rgb":        base_image,
-                "right_wrist_0_rgb": right_wrist_image,
-                "left_wrist_0_rgb":  left_wrist_image,
-            },
-            "image_mask": {
-                "base_0_rgb":        np.True_,
-                "right_wrist_0_rgb": np.True_,
-                "left_wrist_0_rgb":  np.True_,
-            },
+            "image": image,
+            "image_mask": image_mask,
         }
 
         if "actions" in data:

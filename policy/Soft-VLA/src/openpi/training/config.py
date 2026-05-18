@@ -341,6 +341,9 @@ class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
     StepDeltaIntegrateEEActions in outputs recovers absolute EE poses for inference.
     """
 
+    # If False, only the head camera (base_0_rgb) is used — wrist cameras are excluded.
+    use_wrist_cameras: bool = True
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -362,7 +365,7 @@ class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
         # StepDeltaIntegrateEEActions recovers absolute EE poses during inference.
         data_transforms = _transforms.Group(
             inputs=[
-                robotwin_ee_policy.LeRobotRoboTwinEEInputs(),
+                robotwin_ee_policy.LeRobotRoboTwinEEInputs(use_wrist_cameras=self.use_wrist_cameras),
             ],
             outputs=[
                 robotwin_ee_policy.RoboTwinEEOutputs(),

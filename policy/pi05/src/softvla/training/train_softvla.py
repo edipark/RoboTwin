@@ -820,6 +820,10 @@ def train(train_cfg: SoftVLATrainConfig):
                 domain_ids=domain_ids,
             )
             loss = mse.mean()
+            # Per-component losses for wandb logging (action layout: xyz(0:3), rot6d(3:9), gripper(9))
+            loss_trans   = mse[..., 0:3].mean()
+            loss_rot     = mse[..., 3:9].mean()
+            loss_gripper = mse[..., 9:10].mean()
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -845,6 +849,9 @@ def train(train_cfg: SoftVLATrainConfig):
 
                 info = {
                     "loss": loss.item(),
+                    "loss_trans": loss_trans.item(),
+                    "loss_rot": loss_rot.item(),
+                    "loss_gripper": loss_gripper.item(),
                     "lr": current_lr,
                     "grad_norm": float(grad_norm),
                     "soft_prompt_norm": soft_prompt_norm,
