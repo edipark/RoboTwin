@@ -354,7 +354,7 @@ class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
                     {
                         "observation/image":            "image",
                         "observation/wrist_image":      "wrist_image",
-                        # "observation/wrist_image_left": "wrist_image_left",
+                        "observation/wrist_image_left": "wrist_image_left",
                         "observation/state":            "state",
                         "actions":                      "actions",
                         "prompt":                       "prompt",
@@ -740,7 +740,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotRoboTwinEEDataConfig(
-            repo_id="local/robotwin_beat_block_hammer_50",
+            repo_id="local",
             # Reuse norm stats already computed for the full fine-tune config.
             assets=AssetsConfig(assets_dir="./assets/pi05_robotwin_beat_block_hammer"),
             base_config=DataConfig(prompt_from_task=True),

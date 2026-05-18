@@ -118,7 +118,7 @@ class RoboTwinEEOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         actions = np.asarray(data["actions"])
-        return {"actions": actions[..., : self.action_dim]}
+        return {**data, "actions": actions[..., : self.action_dim]}
 
 
 def _parse_image_hwc(image: np.ndarray) -> np.ndarray:
@@ -222,20 +222,56 @@ class LeRobotRoboTwinEEInputs(transforms.DataTransformFn):
     """
 
     def __call__(self, data: dict) -> dict:
-        base_image = _parse_image_hwc(data["observation/image"])
+        # Support two input formats:
+        #   Training (after RepackTransform): flat keys "observation/image", "observation/state", …
+        #   Inference (from pi_model update_observation_window): nested "images" dict + "state"
+        if "images" in data:
+            # Inference format: {"images": {"cam_high": …, "cam_right_wrist": …, "cam_left_wrist": …}, "state": …}
+            imgs = data["images"]
+            base_image = _parse_image_hwc(imgs["cam_high"])
+            if "cam_right_wrist" in imgs:
+                right_wrist_image = _parse_image_hwc(imgs["cam_right_wrist"])
+                right_wrist_mask  = np.True_
+            else:
+                right_wrist_image = np.zeros_like(base_image)
+                right_wrist_mask  = np.False_
+            if "cam_left_wrist" in imgs:
+                left_wrist_image = _parse_image_hwc(imgs["cam_left_wrist"])
+                left_wrist_mask  = np.True_
+            else:
+                left_wrist_image = np.zeros_like(base_image)
+                left_wrist_mask  = np.False_
+            state = data["state"]
+        else:
+            # Training format: flat "observation/*" keys after RepackTransform
+            base_image = _parse_image_hwc(data["observation/image"])
+            if "observation/wrist_image" in data:
+                right_wrist_image = _parse_image_hwc(data["observation/wrist_image"])
+                right_wrist_mask  = np.True_
+            else:
+                right_wrist_image = np.zeros_like(base_image)
+                right_wrist_mask  = np.False_
+            if "observation/wrist_image_left" in data:
+                left_wrist_image = _parse_image_hwc(data["observation/wrist_image_left"])
+                left_wrist_mask  = np.True_
+            else:
+                left_wrist_image = np.zeros_like(base_image)
+                left_wrist_mask  = np.False_
+            state = data["observation/state"]
 
-        image: dict = {"base_0_rgb": base_image}
-        image_mask: dict = {"base_0_rgb": np.True_}
-
-        if "observation/wrist_image" in data:
-            image["right_wrist_0_rgb"] = _parse_image_hwc(data["observation/wrist_image"])
-            image_mask["right_wrist_0_rgb"] = np.True_
-        if "observation/wrist_image_left" in data:
-            image["left_wrist_0_rgb"]  = _parse_image_hwc(data["observation/wrist_image_left"])
-            image_mask["left_wrist_0_rgb"]  = np.True_
+        image: dict = {
+            "base_0_rgb":        base_image,
+            "right_wrist_0_rgb": right_wrist_image,
+            "left_wrist_0_rgb":  left_wrist_image,
+        }
+        image_mask: dict = {
+            "base_0_rgb":        np.True_,
+            "right_wrist_0_rgb": right_wrist_mask,
+            "left_wrist_0_rgb":  left_wrist_mask,
+        }
 
         out: dict = {
-            "state": np.asarray(data["observation/state"], dtype=np.float32),
+            "state": np.asarray(state, dtype=np.float32),
             "image": image,
             "image_mask": image_mask,
         }
