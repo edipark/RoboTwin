@@ -97,19 +97,20 @@ class PI0Pytorch(nn.Module):
             precision=config.dtype,
         )
 
-        self.action_in_proj = nn.Linear(32, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, 32)
+        self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
             self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
         else:
-            self.state_proj = nn.Linear(32, action_expert_config.width)
+            self.state_proj = nn.Linear(config.action_dim, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if config.pytorch_compile_mode is not None:
+            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -126,7 +127,19 @@ class PI0Pytorch(nn.Module):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
+        # Use HuggingFace's API so the setting propagates correctly into the
+        # underlying GemmaModel even when language_model is a PEFT-wrapped model
+        # (apply_lora replaces language_model with a PeftModel; simply setting
+        # the `.gradient_checkpointing` attribute on the PEFT wrapper does NOT
+        # propagate to the inner GemmaModel that actually does the checkpointing).
+        lm = self.paligemma_with_expert.paligemma.language_model
+        if hasattr(lm, "gradient_checkpointing_enable"):
+            # use_reentrant=False: required for DDP compatibility.
+            # reentrant backward can mark the same parameter ready multiple times
+            # when multiple checkpoint segments share a parameter (e.g. layers.17).
+            lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        else:
+            lm.gradient_checkpointing = True
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
@@ -344,6 +357,7 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        att_2d_masks_4d = att_2d_masks_4d.to(dtype=prefix_embs.dtype)  # Match query dtype for SDPA
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):

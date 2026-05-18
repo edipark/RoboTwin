@@ -49,7 +49,9 @@ class Sapien_TEST(gym.Env):
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")
-        except:
+        except Exception as _render_exc:
+            import traceback
+            traceback.print_exc()
             print("\033[31m" + "Render Error" + "\033[0m")
             exit()
 

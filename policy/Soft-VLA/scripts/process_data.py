@@ -42,8 +42,7 @@ import numpy as np
 # ── Resolve openpi path so the canonical layout helpers are importable ──────
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _POLICY_DIR  = os.path.dirname(_SCRIPTS_DIR)
-_REPO_ROOT   = os.path.abspath(os.path.join(_POLICY_DIR, "..", "..", "..", ".."))
-_OPENPI_SRC  = os.path.join(_REPO_ROOT, "src")
+_OPENPI_SRC  = os.path.join(_POLICY_DIR, "src")
 if _OPENPI_SRC not in sys.path:
     sys.path.insert(0, _OPENPI_SRC)
 

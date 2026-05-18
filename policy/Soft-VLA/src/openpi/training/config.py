@@ -326,6 +326,61 @@ class RoboTwinEEDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRoboTwinEEDataConfig(DataConfigFactory):
+    """Data config for RoboTwin right-arm-only 10-D EE-pose fine-tuning via LeRobot datasets.
+
+    Expects a dataset built by scripts/convert_robotwin_hdf5_to_lerobot.py:
+        observation/image, observation/wrist_image, observation/wrist_image_left,
+        observation/state (10-D absolute), actions (10-D step-delta), task.
+
+    Actions are stored as step-delta (matching OXE/LIBERO pretraining format):
+        delta_xyz(3)   = next_xyz - curr_xyz
+        delta_rot6d(6) = 6D(R_curr^T @ R_next)  — relative rotation, near identity
+        gripper(1)     = absolute next-step gripper
+    No additional delta transform is applied at training time.
+    StepDeltaIntegrateEEActions in outputs recovers absolute EE poses for inference.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":            "image",
+                        "observation/wrist_image":      "wrist_image",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "observation/state":            "state",
+                        "actions":                      "actions",
+                        "prompt":                       "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Data is already step-delta; no additional delta transform at training time.
+        # StepDeltaIntegrateEEActions recovers absolute EE poses during inference.
+        data_transforms = _transforms.Group(
+            inputs=[
+                robotwin_ee_policy.LeRobotRoboTwinEEInputs(),
+            ],
+            outputs=[
+                robotwin_ee_policy.RoboTwinEEOutputs(),
+                robotwin_ee_policy.StepDeltaIntegrateEEActions(),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
     This config is used to configure transforms that are applied at various parts of the data pipeline.
@@ -635,6 +690,129 @@ _CONFIGS = [
         data=RoboTwinEEDataConfig(
             assets=AssetsConfig(asset_id="robotwin"),
         ),
+    ),
+    #
+    # Fine-tune pi05 on RoboTwin tasks using LeRobot-format data.
+    # Run scripts/convert_robotwin_hdf5_to_lerobot.py first, then:
+    #   bash scripts/finetune_robotwin.sh
+    # Pass --weight-loader.params-path at the CLI with the JAX params/ directory.
+    TrainConfig(
+        name="pi05_robotwin_beat_block_hammer",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=True),
+        data=LeRobotRoboTwinEEDataConfig(
+            repo_id="local/robotwin_beat_block_hammer_50",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-4,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("REQUIRED"),
+        fsdp_devices=1,
+        num_train_steps=10_000,
+        save_interval=1_000,
+    ),
+    #
+    # LoRA fine-tune pi05 on RoboTwin tasks (single RTX 4090, batch_size=16).
+    # Only LoRA adapters (rank=16, attn+ffn) are trained; base weights are frozen.
+    # Reuses norm stats from the full fine-tune config to avoid recomputation.
+    #   USE_LORA=1 bash scripts/finetune_robotwin.sh
+    TrainConfig(
+        name="pi05_robotwin_beat_block_hammer_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRoboTwinEEDataConfig(
+            repo_id="local/robotwin_beat_block_hammer_50",
+            # Reuse norm stats already computed for the full fine-tune config.
+            assets=AssetsConfig(assets_dir="./assets/pi05_robotwin_beat_block_hammer"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("REQUIRED"),
+        fsdp_devices=1,
+        num_train_steps=10_000,
+        save_interval=1_000,
+    ),
+    TrainConfig(
+        name="pi05_robotwin_stack_blocks_two",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=True),
+        data=LeRobotRoboTwinEEDataConfig(
+            repo_id="local/robotwin_stack_blocks_two_50",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-4,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("REQUIRED"),
+        fsdp_devices=1,
+        num_train_steps=10_000,
+        save_interval=1_000,
+    ),
+    TrainConfig(
+        name="pi05_robotwin_stack_blocks_two_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRoboTwinEEDataConfig(
+            repo_id="local/robotwin_stack_blocks_two_50",
+            assets=AssetsConfig(assets_dir="./assets/pi05_robotwin_stack_blocks_two"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("REQUIRED"),
+        fsdp_devices=1,
+        num_train_steps=10_000,
+        save_interval=1_000,
     ),
     TrainConfig(
         name="pi0_aloha_towel",

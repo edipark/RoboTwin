@@ -25,7 +25,7 @@ class beat_block_hammer(Base_Task):
             rotate_rand=True,
             rotate_lim=[0, 0, 0.5],
         )
-        while abs(block_pose.p[0]) < 0.05 or np.sum(pow(block_pose.p[:2], 2)) < 0.001:
+        while abs(block_pose.p[0]) < -0.05 or np.sum(pow(block_pose.p[:2], 2)) < 0.001:
             block_pose = rand_pose(
                 xlim=[-0.25, 0.25],
                 ylim=[-0.05, 0.15],

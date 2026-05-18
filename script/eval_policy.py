@@ -197,7 +197,7 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    expert_check = args.get("expert_check", True)
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
